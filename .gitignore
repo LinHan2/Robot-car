@@ -1,0 +1,5 @@
+# Generated tracking experiment logs
+tracking_logs/
+
+# Generated VS Code/C++ index databases (can be hundreds of MB)
+.vscode/browse.vc.db*

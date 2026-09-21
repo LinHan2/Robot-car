@@ -1,0 +1,78 @@
+[0.009s] Invoking command in '/home/super9/Desktop/0907_mec_exp/vrpn_ws/build/vrpn_client_ros': CMAKE_PREFIX_PATH=/opt/ros/humble /usr/bin/cmake /home/super9/Desktop/0907_mec_exp/vrpn_ws/src/vrpn_client_ros -DCMAKE_INSTALL_PREFIX=/home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros
+[0.020s] -- Found ament_cmake: 1.3.12 (/opt/ros/humble/share/ament_cmake/cmake)
+[0.131s] -- Found quatlib: /opt/ros/humble/lib/libquat.a  
+[0.133s] -- Looking for pthread.h
+[0.205s] -- Looking for pthread.h - found
+[0.205s] -- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+[0.277s] -- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+[0.277s] -- Found Threads: TRUE  
+[0.278s] -- Found VRPN: /opt/ros/humble/lib/libvrpn.a  
+[0.279s] -- Found rclcpp: 16.0.15 (/opt/ros/humble/share/rclcpp/cmake)
+[0.321s] -- Found rosidl_generator_c: 3.1.7 (/opt/ros/humble/share/rosidl_generator_c/cmake)
+[0.325s] -- Found rosidl_adapter: 3.1.7 (/opt/ros/humble/share/rosidl_adapter/cmake)
+[0.333s] -- Found rosidl_generator_cpp: 3.1.7 (/opt/ros/humble/share/rosidl_generator_cpp/cmake)
+[0.345s] -- Using all available rosidl_typesupport_c: rosidl_typesupport_fastrtps_c;rosidl_typesupport_introspection_c
+[0.360s] -- Using all available rosidl_typesupport_cpp: rosidl_typesupport_fastrtps_cpp;rosidl_typesupport_introspection_cpp
+[0.399s] -- Found rmw_implementation_cmake: 6.1.2 (/opt/ros/humble/share/rmw_implementation_cmake/cmake)
+[0.402s] -- Found rmw_fastrtps_cpp: 6.2.9 (/opt/ros/humble/share/rmw_fastrtps_cpp/cmake)
+[0.494s] -- Found OpenSSL: /usr/lib/x86_64-linux-gnu/libcrypto.so (found version "3.0.2")  
+[0.518s] -- Found FastRTPS: /opt/ros/humble/include  
+[0.558s] -- Using RMW implementation 'rmw_fastrtps_cpp' as default
+[0.616s] -- Found geometry_msgs: 4.9.0 (/opt/ros/humble/share/geometry_msgs/cmake)
+[0.628s] -- Found tf2: 0.25.16 (/opt/ros/humble/share/tf2/cmake)
+[0.639s] -- Found tf2_ros: 0.25.16 (/opt/ros/humble/share/tf2_ros/cmake)
+[0.721s] -- Found ament_lint_auto: 0.12.14 (/opt/ros/humble/share/ament_lint_auto/cmake)
+[0.791s] -- Added test 'copyright' to check source files copyright and LICENSE
+[0.795s] -- Added test 'cppcheck' to perform static code analysis on C / C++ code
+[0.795s] -- Configured cppcheck include dirs: /home/super9/Desktop/0907_mec_exp/vrpn_ws/src/vrpn_client_ros/include
+[0.795s] -- Configured cppcheck exclude dirs and/or files: 
+[0.799s] -- Added test 'cpplint' to check C / C++ code against the Google style
+[0.799s] -- Configured cpplint exclude dirs and/or files: 
+[0.800s] -- Added test 'flake8' to check Python code syntax and style conventions
+[0.801s] -- Added test 'lint_cmake' to check CMake code style
+[0.802s] -- Added test 'pep257' to check Python code against some of the docstring style conventions in PEP 257
+[0.805s] -- Added test 'uncrustify' to check C / C++ code style
+[0.805s] -- Configured uncrustify additional arguments: 
+[0.806s] -- Added test 'xmllint' to check XML markup files
+[0.808s] -- Configuring done
+[0.824s] -- Generating done
+[0.830s] -- Build files have been written to: /home/super9/Desktop/0907_mec_exp/vrpn_ws/build/vrpn_client_ros
+[0.838s] Invoked command in '/home/super9/Desktop/0907_mec_exp/vrpn_ws/build/vrpn_client_ros' returned '0': CMAKE_PREFIX_PATH=/opt/ros/humble /usr/bin/cmake /home/super9/Desktop/0907_mec_exp/vrpn_ws/src/vrpn_client_ros -DCMAKE_INSTALL_PREFIX=/home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros
+[0.839s] Invoking command in '/home/super9/Desktop/0907_mec_exp/vrpn_ws/build/vrpn_client_ros': CMAKE_PREFIX_PATH=/opt/ros/humble /usr/bin/cmake --build /home/super9/Desktop/0907_mec_exp/vrpn_ws/build/vrpn_client_ros -- -j16 -l16
+[0.891s] [ 16%] [32mBuilding CXX object CMakeFiles/vrpn_client_ros.dir/src/vrpn_client_ros.cpp.o[0m
+[5.459s] [ 33%] [32m[1mLinking CXX static library libvrpn_client_ros.a[0m
+[5.544s] [ 33%] Built target vrpn_client_ros
+[5.565s] [ 50%] [32mBuilding CXX object CMakeFiles/vrpn_client_node.dir/src/vrpn_client_node.cpp.o[0m
+[5.567s] [ 66%] [32mBuilding CXX object CMakeFiles/vrpn_tracker_node.dir/src/vrpn_tracker_node.cpp.o[0m
+[7.917s] [ 83%] [32m[1mLinking CXX executable vrpn_client_node[0m
+[7.929s] [100%] [32m[1mLinking CXX executable vrpn_tracker_node[0m
+[8.187s] [100%] Built target vrpn_client_node
+[8.187s] [100%] Built target vrpn_tracker_node
+[8.198s] Invoked command in '/home/super9/Desktop/0907_mec_exp/vrpn_ws/build/vrpn_client_ros' returned '0': CMAKE_PREFIX_PATH=/opt/ros/humble /usr/bin/cmake --build /home/super9/Desktop/0907_mec_exp/vrpn_ws/build/vrpn_client_ros -- -j16 -l16
+[8.210s] Invoking command in '/home/super9/Desktop/0907_mec_exp/vrpn_ws/build/vrpn_client_ros': CMAKE_PREFIX_PATH=/opt/ros/humble /usr/bin/cmake --install /home/super9/Desktop/0907_mec_exp/vrpn_ws/build/vrpn_client_ros
+[8.218s] -- Install configuration: ""
+[8.218s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros//launch
+[8.218s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros//launch/sample.launch.py
+[8.219s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros//config
+[8.219s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros//config/sample.params.yaml
+[8.219s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/lib/libvrpn_client_ros.a
+[8.224s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/lib/vrpn_client_ros/vrpn_tracker_node
+[8.226s] -- Set runtime path of "/home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/lib/vrpn_client_ros/vrpn_tracker_node" to ""
+[8.226s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/lib/vrpn_client_ros/vrpn_client_node
+[8.229s] -- Set runtime path of "/home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/lib/vrpn_client_ros/vrpn_client_node" to ""
+[8.230s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/ament_index/resource_index/package_run_dependencies/vrpn_client_ros
+[8.230s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/ament_index/resource_index/parent_prefix_path/vrpn_client_ros
+[8.230s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros/environment/ament_prefix_path.sh
+[8.230s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros/environment/ament_prefix_path.dsv
+[8.230s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros/environment/path.sh
+[8.230s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros/environment/path.dsv
+[8.230s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros/local_setup.bash
+[8.231s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros/local_setup.sh
+[8.231s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros/local_setup.zsh
+[8.231s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros/local_setup.dsv
+[8.231s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros/package.dsv
+[8.231s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/ament_index/resource_index/packages/vrpn_client_ros
+[8.232s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros/cmake/vrpn_client_rosConfig.cmake
+[8.232s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros/cmake/vrpn_client_rosConfig-version.cmake
+[8.232s] -- Installing: /home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros/share/vrpn_client_ros/package.xml
+[8.234s] Invoked command in '/home/super9/Desktop/0907_mec_exp/vrpn_ws/build/vrpn_client_ros' returned '0': CMAKE_PREFIX_PATH=/opt/ros/humble /usr/bin/cmake --install /home/super9/Desktop/0907_mec_exp/vrpn_ws/build/vrpn_client_ros

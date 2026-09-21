@@ -1,0 +1,65 @@
+# Bearing-only tracking 实车启动参数
+# 默认值对应 2026-09-09（昨天）最后一次稳定实验。
+# 修改后直接启动 Python 即会自动读取；命令行同名参数仍可临时覆盖。
+# -------------------- 机器人身份和 ROS 话题 --------------------
+target_id: 16
+pursuer_id: 3
+target_pose_topic: null       # null -> /robot16/pose
+pursuer_pose_topic: null      # null -> /robot03/pose
+target_vel_topic: null        # null -> /robot16/vel_cmd
+vel_topic: null               # null -> /robot03/vel_cmd
+body_yaw_offset_deg: 0.0      # 动捕已经校正，不再旋转补偿
+# -------------------- 采样和期望相对轨迹 --------------------
+rate: 50.0                    # 控制频率 Hz；dt = 1/rate = 0.02 s
+window: 2.0               # 动捕位置反馈仿真值；增强低速运动下的积分激励
+relative_radius: 0.7     # 期望相对距离/极限环半径 Rd，米
+relative_angular_speed: 0.5 # 3x3 仿真候选值；提高相对轨迹角速度
+relative_initial_phase_deg: 0.0    # 针对 target 位于 pursuer 上方的启动几何
+max_speed: 0.5       # 两车速度指令限幅 m/s；0 表示关闭
+tracking_gain: 0.8        # 动捕位置反馈仿真值；抑制持续相对位置振荡
+# -------------------- RBF 目标输入模型 --------------------
+rbf_count: 30           # 每个输出通道的 RBF 数量 q
+rbf_sigma: 0.52               # 高斯 RBF 宽度 sigma
+# -------------------- 当前窗和历史栈辨识器 --------------------
+history_size: 30              # 最大历史窗口数 Nh
+gamma: 0.0015           # 仿真收敛值；保留约 16 个可靠激活方向
+current_window_threshold: 0.00001  # 当前窗激活阈值 ac
+window_valid_tolerance: 2.220446049250313e-14
+current_window_gain: 2.0      # 当前窗口学习增益 kc
+history_gain: 1.2            # 历史栈学习增益 kh
+max_history_condition: 1000.0 # 条件数超过该值时冻结历史估计；0 关闭
+sigma_theta: 0.003            # 未激活参数方向泄漏系数
+# -------------------- 输入滤波和相对状态观测器 --------------------
+use_mocap_relative_position: true  # true: Kr 使用动捕 r=pT-pO；false: 使用观测器 rHat
+target_estimate_filter_bandwidth: 5.0  # 仿真收敛值；减小 uT_hat 滤波滞后
+riccati_lambda: 0.15          # Riccati 稳定化参数 lambda_s；提高观测器收敛速度
+observer_noise_weight: 0.02   # R_o = ro * I 中的 ro
+riccati_eigenvalue_floor: 1.0e-9
+# -------------------- 目标车运动律 --------------------
+# uT = vd*d + ve*b + vj*J*b
+target_vd: 0.0               # 取消固定世界方向漂移，使活动区域保持在起点附近
+target_ve: 0.008             # 沿方位 b 缓慢远离 pursuer
+target_vj: 0.15              # 沿 J*b 切向运动
+target_direction_deg: 155.0   # 固定方向 d；vd=0 时暂不起作用
+# -------------------- target 世界坐标软边界 --------------------
+# 3x3 m 围栏：进入边界前 margin 米后，逐渐叠加指向场内的平滑速度。
+target_soft_boundary: true
+field_x_min: -1.5
+field_x_max: 1.5
+field_y_min: -1.5
+field_y_max: 1.5
+target_boundary_margin: 0.30       # 距围栏 0.30 m 时开始干预
+target_boundary_speed: 0.15        # 到围栏处的最大单轴回推速度 m/s
+# -------------------- 动捕速度估计和数据超时 --------------------
+stale_timeout: 0.3
+mocap_velocity_window: 0.06
+mocap_velocity_filter_tau: 0.02
+mocap_max_valid_speed: 0.8    # 动捕异常速度拒绝阈值；0 表示关闭
+# -------------------- 实时显示和实验数据保存 --------------------
+telemetry_period: 1.0
+plot: true
+plot_history: 30.0
+save_plot: tracking_diagnostics.png       # 项目根目录中的最新预览图
+save_analysis_plot: tracking_analysis.png # 项目根目录中的最新分析图
+save_data: true
+data_dir: tracking_logs        # 每次实验另存到独立时间戳子目录，不覆盖

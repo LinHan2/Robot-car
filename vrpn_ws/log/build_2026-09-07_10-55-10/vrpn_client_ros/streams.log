@@ -1,0 +1,35 @@
+[0.013s] Invoking command in '/home/super9/Desktop/0907_mec_exp/vrpn_ws/build/vrpn_client_ros': CMAKE_PREFIX_PATH=/opt/ros/humble /usr/bin/cmake /home/super9/Desktop/0907_mec_exp/vrpn_ws/src/vrpn_client_ros -DCMAKE_INSTALL_PREFIX=/home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros
+[0.114s] -- The C compiler identification is GNU 11.4.0
+[0.199s] -- The CXX compiler identification is GNU 11.4.0
+[0.212s] -- Detecting C compiler ABI info
+[0.297s] -- Detecting C compiler ABI info - done
+[0.302s] -- Check for working C compiler: /usr/bin/cc - skipped
+[0.302s] -- Detecting C compile features
+[0.303s] -- Detecting C compile features - done
+[0.306s] -- Detecting CXX compiler ABI info
+[0.379s] -- Detecting CXX compiler ABI info - done
+[0.383s] -- Check for working CXX compiler: /usr/bin/c++ - skipped
+[0.383s] -- Detecting CXX compile features
+[0.384s] -- Detecting CXX compile features - done
+[0.388s] -- Found ament_cmake: 1.3.12 (/opt/ros/humble/share/ament_cmake/cmake)
+[0.519s] -- Found Python3: /usr/bin/python3 (found version "3.10.12") found components: Interpreter 
+[0.618s] [31mCMake Error at CMakeLists.txt:22 (find_package):
+[0.618s]   By not providing "FindVRPN.cmake" in CMAKE_MODULE_PATH this project has
+[0.618s]   asked CMake to find a package configuration file provided by "VRPN", but
+[0.618s]   CMake did not find one.
+[0.618s] 
+[0.618s]   Could not find a package configuration file provided by "VRPN" with any of
+[0.618s]   the following names:
+[0.618s] 
+[0.618s]     VRPNConfig.cmake
+[0.619s]     vrpn-config.cmake
+[0.619s] 
+[0.619s]   Add the installation prefix of "VRPN" to CMAKE_PREFIX_PATH or set
+[0.619s]   "VRPN_DIR" to a directory containing one of the above files.  If "VRPN"
+[0.619s]   provides a separate development package or SDK, be sure it has been
+[0.619s]   installed.
+[0.619s] 
+[0.619s] [0m
+[0.619s] -- Configuring incomplete, errors occurred!
+[0.619s] See also "/home/super9/Desktop/0907_mec_exp/vrpn_ws/build/vrpn_client_ros/CMakeFiles/CMakeOutput.log".
+[0.622s] Invoked command in '/home/super9/Desktop/0907_mec_exp/vrpn_ws/build/vrpn_client_ros' returned '1': CMAKE_PREFIX_PATH=/opt/ros/humble /usr/bin/cmake /home/super9/Desktop/0907_mec_exp/vrpn_ws/src/vrpn_client_ros -DCMAKE_INSTALL_PREFIX=/home/super9/Desktop/0907_mec_exp/vrpn_ws/install/vrpn_client_ros

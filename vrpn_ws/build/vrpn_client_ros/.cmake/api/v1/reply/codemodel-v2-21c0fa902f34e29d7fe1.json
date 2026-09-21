@@ -1,0 +1,97 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-7d0166b7df3cd4e1079f.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.12"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3,
+						4
+					]
+				}
+			],
+			"name" : "",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "vrpn_client_ros",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3,
+						4
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-uninstall-861d7cf39f4172b3e1a1.json",
+					"name" : "uninstall",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "vrpn_client_node::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-vrpn_client_node-e919bd3ca7efef23f5d5.json",
+					"name" : "vrpn_client_node",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "vrpn_client_ros::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-vrpn_client_ros-b641462133f0fa28be17.json",
+					"name" : "vrpn_client_ros",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "vrpn_client_ros_uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-vrpn_client_ros_uninstall-2db7f62ee390af914237.json",
+					"name" : "vrpn_client_ros_uninstall",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "vrpn_tracker_node::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-vrpn_tracker_node-402e164243554af30861.json",
+					"name" : "vrpn_tracker_node",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "/home/super9/Desktop/0907_mec_exp/vrpn_ws/build/vrpn_client_ros",
+		"source" : "/home/super9/Desktop/0907_mec_exp/vrpn_ws/src/vrpn_client_ros"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 3
+	}
+}

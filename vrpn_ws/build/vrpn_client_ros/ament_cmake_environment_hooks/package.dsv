@@ -1,0 +1,4 @@
+source;share/vrpn_client_ros/local_setup.bash
+source;share/vrpn_client_ros/local_setup.dsv
+source;share/vrpn_client_ros/local_setup.sh
+source;share/vrpn_client_ros/local_setup.zsh
