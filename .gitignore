@@ -3,3 +3,6 @@ tracking_logs/
 
 # Generated VS Code/C++ index databases (can be hundreds of MB)
 .vscode/browse.vc.db*
+tracking_logs_vrpn.vscode/BROWSE.VC.DB
+.vscode/*.VC.DB
+.vscode/ipch/

@@ -4,22 +4,21 @@
 demo_2d_bearing_tracking_direct_v1.py
 =====================================
 
-ROS 2 implementation of ``demo_2d_bearing_tracking_direct_v1.m``.
+ROS 1 implementation of ``demo_2d_bearing_tracking_direct_v1.m``.
 
 The node controls a fully-actuated omnidirectional target (T) with the
 MATLAB evasion law and a pursuer (O) that tracks it using bearing-only data.
 
-Required topics (ROS_DOMAIN_ID=0):
-  /robotXX/pose     geometry_msgs/PoseStamped
-  /robotXX/vel_cmd  geometry_msgs/TwistStamped
+Default topics:
+    /vrpn_client_node/tianbot{1,2}/pose  geometry_msgs/PoseStamped
+    /tianbot{1,2}/cmd_vel                geometry_msgs/Twist
 
 The paper/MATLAB algorithm is written in a world frame.  The robot command
-interface is body-frame, so the computed world velocity is rotated using the
-pursuer yaw before publishing.  ``angular.z`` is kept at zero so the chassis
-can use its heading-hold behavior.
+interface is body-frame, so the computed world velocity is rotated using each
+robot's VRPN yaw before publishing.  ``angular.z`` is always zero.
 
-Example (robot04 is the target and robot03 is the pursuer):
-  python3 demo_2d_bearing_tracking_direct_v1.py --target-id 4 --pursuer-id 3
+Default dual-Tianbot launch:
+    python3 demo_2d_bearing_tracking_direct_v1.py
 
 The bridge and both chassis should already be running, and the chassis should
 be unlocked separately with ``utils/activate_sign.py``.
@@ -32,16 +31,16 @@ be unlocked separately with ``utils/activate_sign.py``.
    动捕相对位置，但此时不再是严格的 bearing-only 控制。
 4. ``uO_cmd`` 是 pursuer 的控制指令，``u_o_actual`` 是由 pursuer 动捕状态
    估计得到的实际世界速度。辨识器和观测器使用后者，不用控制指令冒充实际速度。
-5. target=robot04、pursuer=robot03 是默认身份，可由命令行参数覆盖。
+5. 默认读取双 Tianbot VRPN 配置；可用 ``--config`` 切换其他实验配置。
 """
 
 import argparse
 import csv
 import json
 import math
-import multiprocessing as mp
 import os
 import queue
+import signal
 import threading
 import time
 from collections import deque
@@ -52,9 +51,10 @@ from typing import List, Optional, Tuple
 import numpy as np
 import yaml
 
-import rclpy
-from geometry_msgs.msg import PoseStamped, TwistStamped
-from rclpy.node import Node
+from recording_quality import filter_recording, save_quality_exports
+
+import rospy
+from geometry_msgs.msg import PoseStamped, Twist
 
 
 DEFAULT_PLOT_PATH = os.path.join(
@@ -63,27 +63,26 @@ DEFAULT_PLOT_PATH = os.path.join(
 DEFAULT_ANALYSIS_PLOT_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "tracking_analysis.png"
 )
+DEFAULT_COMPARISON_PLOT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "bearing_tracking_comparison.png"
+)
 DEFAULT_DATA_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "tracking_logs"
 )
 DEFAULT_CONFIG_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "bearing_tracking_params.yaml"
+    os.path.dirname(os.path.abspath(__file__)),
+    "bearing_tracking_tianbot_vrpn_params.yaml",
 )
 
 
 # ============================================================================
-# 基础工具：机器人命名、角度处理、二维坐标变换和速度限幅
+# 基础工具：机器人命名、二维坐标变换和速度限幅
 # ============================================================================
 
 
 def robot_name(robot_id: int) -> str:
     """把整数 ID 转成 ROS 名称，例如 3 -> ``robot03``。"""
     return f"robot{robot_id:02d}"
-
-
-def wrap_to_pi(angle: float) -> float:
-    """把任意弧度角归一化到 [-pi, pi)。"""
-    return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
@@ -218,6 +217,17 @@ class TelemetrySample:
 
     # 辨识器、观测器、历史栈和速度差分质量。
     theta_hat_norm: float
+    identifier_current_theta_dot_norm: float
+    identifier_history_theta_dot_norm: float
+    identifier_leak_theta_dot_norm: float
+    identifier_current_output_rate_x: float
+    identifier_current_output_rate_y: float
+    identifier_history_output_rate_x: float
+    identifier_history_output_rate_y: float
+    identifier_leak_output_rate_x: float
+    identifier_leak_output_rate_y: float
+    identifier_total_output_rate_x: float
+    identifier_total_output_rate_y: float
     xi_position_norm: float
     xi_velocity_norm: float
     po_min_eigenvalue: float
@@ -232,16 +242,23 @@ class TelemetrySample:
     current_window_count: int
     current_window_excitation: float
     chi: float
+    history_last_window_execution_error: float
+    history_last_window_accepted: int
     pursuer_velocity_sample_count: int
     pursuer_velocity_sample_span: float
     pursuer_velocity_sample_accepted: int
+    target_pose_sample_time: float = float("nan")
+    pursuer_pose_sample_time: float = float("nan")
+    target_velocity_timestamp_resets: int = 0
+    pursuer_velocity_timestamp_resets: int = 0
 
 
 class MocapVelocityEstimator:
-    """用短窗位置回归估计世界系实际速度，并保留完整质量诊断。
+    """用 VRPN 位置窗口拟合世界系实际速度，并保留完整质量诊断。
 
-    pursuer 的滤波结果进入算法；target 的同类估计只用于检验“指令=实际”这一
-    MATLAB 理想假设。原始斜率、窗口跨度、样本数和是否接受都会写入日志。
+    不订阅里程计或任何速度话题。pursuer 的位置差分结果进入算法积分；target
+    的同类估计只用于检验“指令=实际”这一 MATLAB 理想假设。异常位姿跳变时保留
+    上一有效结果，避免把单帧动捕错误注入辨识器和观测器。
     """
 
     def __init__(self, window: float, filter_tau: float,
@@ -250,6 +267,7 @@ class MocapVelocityEstimator:
         self.filter_tau = filter_tau
         self.max_valid_speed = max_valid_speed
         self.samples = deque(maxlen=max_samples)
+        self.timestamp_reset_count = 0
         self.previous_estimate_time: Optional[float] = None
         self.filtered_velocity = np.zeros(2, dtype=float)
         self.have_filtered_velocity = False
@@ -272,37 +290,37 @@ class MocapVelocityEstimator:
     def add_pose(self, sample_time: float, position: np.ndarray) -> None:
         """加入动捕位置；时间不递增时自动切断旧回归窗口。"""
         if self.samples and sample_time <= self.samples[-1][0]:
+            self.timestamp_reset_count += 1
             self.reset()
         self.samples.append((sample_time, position.copy()))
 
     def estimate(self, nominal_dt: float) -> np.ndarray:
-        """返回滤波速度；数据不足/异常时保持上一次有效结果。"""
+        """返回最近窗口的位置拟合速度；数据不足/异常时保持上一有效结果。"""
         self.sample_accepted = False
-        if len(self.samples) < 3:
+        if len(self.samples) < 2:
             self.sample_count = len(self.samples)
             self.sample_span = 0.0
             return self.filtered_velocity.copy()
 
         latest_time = self.samples[-1][0]
-        cutoff = latest_time - self.window
-        recent = [sample for sample in self.samples if sample[0] >= cutoff]
-        self.sample_count = len(recent)
-        if len(recent) < 3:
-            self.sample_span = 0.0
+        cutoff_time = latest_time - self.window
+        window_samples = [
+            sample for sample in self.samples
+            if sample[0] >= cutoff_time - 1.0e-9
+        ]
+        self.sample_count = len(window_samples)
+        self.sample_span = float(latest_time - window_samples[0][0])
+        if self.sample_span <= 1.0e-4:
             return self.filtered_velocity.copy()
 
-        sample_times = np.asarray([sample[0] for sample in recent], dtype=float)
-        positions = np.asarray([sample[1] for sample in recent], dtype=float)
-        self.sample_span = float(sample_times[-1] - sample_times[0])
-        if self.sample_span < 0.75 * self.window:
-            return self.filtered_velocity.copy()
-
-        centered_time = sample_times - float(np.mean(sample_times))
-        denominator = float(centered_time @ centered_time)
-        if denominator <= 1.0e-10:
+        times = np.asarray([sample[0] for sample in window_samples], dtype=float)
+        positions = np.asarray([sample[1] for sample in window_samples], dtype=float)
+        centered_times = times - float(np.mean(times))
+        time_energy = float(centered_times @ centered_times)
+        if time_energy <= 1.0e-12:
             return self.filtered_velocity.copy()
         self.raw_velocity = np.asarray(
-            (centered_time @ positions) / denominator, dtype=float
+            centered_times @ positions / time_energy, dtype=float
         )
 
         # 同一批动捕帧只更新一次滤波器，50 Hz 控制定时器可重复读取当前结果。
@@ -338,8 +356,12 @@ class MocapVelocityEstimator:
 class DiagnosticsRecorderWorker(threading.Thread):
     """后台保存完整实验数据；磁盘 I/O 不在 ROS 控制定时器中执行。"""
 
-    def __init__(self, samples: queue.Queue, output_dir: str, metadata: dict):
-        super().__init__(name="tracking-recorder", daemon=True)
+    def __init__(self, samples: queue.Queue, output_dir: str, metadata: dict,
+                 latest_comparison_path: Optional[str],
+                 latest_plot_path: Optional[str] = None,
+                 latest_analysis_path: Optional[str] = None,
+                 save_figures: bool = True):
+        super().__init__(name="tracking-recorder", daemon=False)
         self.samples = samples
         self.output_dir = output_dir
         self.metadata = metadata
@@ -347,6 +369,13 @@ class DiagnosticsRecorderWorker(threading.Thread):
         self.csv_path = os.path.join(output_dir, "tracking_data.csv")
         self.npz_path = os.path.join(output_dir, "tracking_data.npz")
         self.summary_path = os.path.join(output_dir, "summary.json")
+        self.comparison_path = os.path.join(
+            output_dir, "bearing_tracking_sim_comparison.png"
+        )
+        self.latest_comparison_path = latest_comparison_path
+        self.latest_plot_path = latest_plot_path
+        self.latest_analysis_path = latest_analysis_path
+        self.save_figures = save_figures
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -393,6 +422,25 @@ class DiagnosticsRecorderWorker(threading.Thread):
         with open(self.summary_path, "w", encoding="utf-8") as stream:
             json.dump(summary, stream, indent=2, ensure_ascii=False)
 
+    def _save_recording_export(self, columns: dict,
+                               filename: str = "errors_and_positions.csv") -> None:
+        """另存实验录制常用的逐帧误差、位置及误差重算所需的向量。"""
+        names = (
+            "t", "input_error", "localization_error", "tracking_error",
+            "target_x", "target_y", "target_yaw",
+            "pursuer_x", "pursuer_y", "pursuer_yaw",
+            "relative_x", "relative_y",
+            "relative_estimate_x", "relative_estimate_y",
+            "desired_relative_x", "desired_relative_y",
+            "target_mocap_velocity_x", "target_mocap_velocity_y",
+            "target_velocity_estimate_x", "target_velocity_estimate_y",
+        )
+        path = os.path.join(self.output_dir, filename)
+        with open(path, "w", newline="", encoding="utf-8") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(names)
+            writer.writerows(zip(*(columns[name] for name in names)))
+
     def _save_separate_plots(self, columns: dict) -> None:
         """使用完整 CSV 数据生成四张互相独立的实验图。
 
@@ -412,12 +460,13 @@ class DiagnosticsRecorderWorker(threading.Thread):
             name: np.asarray(values, dtype=float)
             for name, values in columns.items()
         }
-        time_axis = arrays["t"] - arrays["t"][0]
+        time_axis = arrays["t"]
 
         def finish_time_plot(figure, axis, title: str,
                              ylabel: str, filename: str) -> None:
             axis.set_title(title)
             axis.set_xlabel("time (s)")
+            axis.set_xlim(0.0, max(float(time_axis[-1]), 0.02))
             axis.set_ylabel(ylabel)
             axis.set_ylim(bottom=0.0)
             axis.grid(True, color="#b0b0b0", alpha=0.55)
@@ -529,6 +578,87 @@ class DiagnosticsRecorderWorker(threading.Thread):
             flush=True,
         )
 
+    def _save_simulation_comparison(self, columns: dict) -> None:
+        """保存与纯 Python 仿真同版式的全程 2x2 对比图。"""
+        if not columns["t"]:
+            return
+
+        os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        arrays = {
+            name: np.asarray(values, dtype=float)
+            for name, values in columns.items()
+        }
+        time_axis = arrays["t"]
+        figure, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+        axis = axes[0, 0]
+        axis.plot(arrays["target_x"], arrays["target_y"], label="target")
+        axis.plot(arrays["pursuer_x"], arrays["pursuer_y"], label="pursuer")
+        axis.set_title("World trajectory")
+        axis.set_xlabel("x (m)")
+        axis.set_ylabel("y (m)")
+        axis.set_aspect("equal", adjustable="box")
+        axis.grid(True)
+        axis.legend(loc="best")
+
+        axis = axes[0, 1]
+        axis.plot(time_axis, arrays["input_error"], label=r"$\|u_T-\hat{u}_T\|$")
+        axis.plot(time_axis, arrays["localization_error"], label=r"$\|r-\hat{r}\|$")
+        axis.plot(time_axis, arrays["tracking_error"], label=r"$\|r-r_d\|$")
+        axis.set_title("Errors")
+        axis.set_xlabel("time (s)")
+        axis.set_ylabel("error")
+        axis.grid(True)
+        axis.legend(loc="best")
+
+        axis = axes[1, 0]
+        axis.plot(
+            time_axis,
+            np.hypot(arrays["target_mocap_velocity_x"], arrays["target_mocap_velocity_y"]),
+            label=r"$\|u_T\|$ mocap",
+        )
+        axis.plot(
+            time_axis,
+            np.hypot(arrays["mocap_velocity_x"], arrays["mocap_velocity_y"]),
+            label=r"$\|u_O\|$ mocap",
+        )
+        axis.plot(time_axis, arrays["pursuer_speed"], "--", label=r"$\|u_O\|$ command")
+        axis.set_title("Command and position-difference speeds")
+        axis.set_xlabel("time (s)")
+        axis.set_ylabel("m/s")
+        axis.grid(True)
+        axis.legend(loc="best")
+
+        axis = axes[1, 1]
+        axis.step(time_axis, arrays["active_directions"], where="post",
+                  label="active RBF directions")
+        axis.step(time_axis, arrays["history_count"], where="post",
+                  label="history windows")
+        axis.set_title("History-stack excitation")
+        axis.set_xlabel("time (s)")
+        axis.set_ylabel("count")
+        axis.grid(True)
+        axis.legend(loc="best")
+
+        for axis in (axes[0, 1], axes[1, 0], axes[1, 1]):
+            axis.set_xlim(0.0, max(float(time_axis[-1]), 0.02))
+        figure.tight_layout()
+        for path in (self.comparison_path, self.latest_comparison_path):
+            if path:
+                parent = os.path.dirname(os.path.abspath(path))
+                os.makedirs(parent, exist_ok=True)
+                figure.savefig(path, dpi=180, bbox_inches="tight")
+        plt.close(figure)
+        print(
+            "[DATA] saved simulation-style comparison: "
+            f"{self.comparison_path}",
+            flush=True,
+        )
+
     def run(self) -> None:
         names = [item.name for item in fields(TelemetrySample)]
         columns = {name: [] for name in names}
@@ -568,7 +698,28 @@ class DiagnosticsRecorderWorker(threading.Thread):
                 **{name: np.asarray(value) for name, value in columns.items()},
             )
             self._save_summary(columns)
-            self._save_separate_plots(columns)
+            self._save_recording_export(columns, "errors_and_positions_raw.csv")
+            clean, plot_columns, flags, quality_report = filter_recording(
+                columns, self.metadata.get("arguments", {})
+            )
+            save_quality_exports(self.output_dir, columns, clean, flags, quality_report)
+            self._save_recording_export(clean)
+            print(
+                f"[DATA] excluded {quality_report['excluded_samples']}/"
+                f"{quality_report['raw_samples']} low-quality samples from cleaned exports; "
+                "raw CSV/NPZ retained",
+                flush=True,
+            )
+            if self.save_figures:
+                self._save_simulation_comparison(plot_columns)
+                save_diagnostics_figures(
+                    plot_columns,
+                    save_path=self.latest_plot_path,
+                    analysis_save_path=self.latest_analysis_path,
+                    archive_plot_path=os.path.join(self.output_dir, "tracking_diagnostics.png"),
+                    archive_analysis_path=os.path.join(self.output_dir, "tracking_analysis.png"),
+                )
+                self._save_separate_plots(plot_columns)
             print(f"[DATA] saved experiment data: {self.output_dir}", flush=True)
         except Exception as exc:
             print(f"[DATA] failed to save experiment data: {exc}", flush=True)
@@ -626,32 +777,24 @@ class ConsoleTelemetryWorker(threading.Thread):
                 )
 
 
-def realtime_plot_process(
-    samples,
-    history_seconds: float,
-    desired_range: float,
+def save_diagnostics_figures(
+    columns: dict,
     save_path: Optional[str] = None,
     analysis_save_path: Optional[str] = None,
+    comparison_save_path: Optional[str] = None,
     archive_plot_path: Optional[str] = None,
     archive_analysis_path: Optional[str] = None,
 ) -> None:
-    """独立绘图进程：一张 MATLAB 对照图 + 一张实车差异诊断图。
-
-    所有图形运算和 PNG 写盘都位于独立进程，不占用 ROS 控制定时器。实时窗口
-    只显示最近 ``history_seconds`` 秒，完整全程数据由另一个后台线程保存。
-    """
+    """实验结束后从完整记录绘图，所有时间轴固定为 0 到结束时刻。"""
+    if not columns["t"]:
+        return
     os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    max_samples = max(100, int(history_seconds * 100.0))
-    data = deque(maxlen=max_samples)
-    plt.ion()
     figure, axes = plt.subplots(2, 2, figsize=(11, 7))
     analysis_figure, analysis_axes = plt.subplots(4, 2, figsize=(13, 13))
-    figure.canvas.manager.set_window_title("Bearing Tracking: MATLAB Comparison")
-    analysis_figure.canvas.manager.set_window_title("Bearing Tracking: Real-System Analysis")
-    last_draw = 0.0
-    last_save = 0.0
 
     def save_figure(target_figure, path: Optional[str]) -> None:
         if not path:
@@ -664,37 +807,25 @@ def realtime_plot_process(
             print(f"[PLOT] failed to save {path}: {exc}", flush=True)
 
     def array(values, name: str) -> np.ndarray:
-        return np.asarray([getattr(sample, name) for sample in values], dtype=float)
+        return np.asarray(values[name], dtype=float)
 
     def vector_norm(values, x_name: str, y_name: str) -> np.ndarray:
         return np.hypot(array(values, x_name), array(values, y_name))
 
     def style_axis(ax, title: str, ylabel: str) -> None:
         ax.set_title(title)
-        ax.set_xlabel("time from now (s)")
+        ax.set_xlabel("time (s)")
+        ax.set_xlim(0.0, max(float(columns["t"][-1]), 0.02))
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.7)
         ax.legend(loc="best", fontsize="small")
 
     def draw_matlab_comparison(values, ts) -> None:
-        """复现 MATLAB 最关心的轨迹、三误差、速度和相对距离。"""
+        """保存纯 Python 仿真 comparison 图的全程 2x2 布局。"""
         ax = axes[0, 0]
         ax.clear()
         ax.plot(array(values, "target_x"), array(values, "target_y"), label="target")
         ax.plot(array(values, "pursuer_x"), array(values, "pursuer_y"), label="pursuer")
-        latest = values[-1]
-        ax.quiver(
-            latest.pursuer_x, latest.pursuer_y,
-            latest.command_world_x, latest.command_world_y,
-            angles="xy", scale_units="xy", scale=1.0,
-            color="tab:red", width=0.006, label="uO command",
-        )
-        ax.quiver(
-            latest.pursuer_x, latest.pursuer_y,
-            latest.mocap_velocity_x, latest.mocap_velocity_y,
-            angles="xy", scale_units="xy", scale=1.0,
-            color="tab:green", width=0.006, label="uO mocap",
-        )
         ax.set_title("World trajectory")
         ax.set_xlabel("x (m)")
         ax.set_ylabel("y (m)")
@@ -707,7 +838,7 @@ def realtime_plot_process(
         ax.plot(ts, array(values, "input_error"), label="||uT_actual-uTHat|| (m/s)")
         ax.plot(ts, array(values, "localization_error"), label="||r-rHat|| (m)")
         ax.plot(ts, array(values, "tracking_error"), label="||r-rd|| (m)")
-        style_axis(ax, "MATLAB estimation and tracking errors", "error")
+        style_axis(ax, "Errors", "error")
 
         ax = axes[1, 0]
         ax.clear()
@@ -720,16 +851,15 @@ def realtime_plot_process(
             label="||uO|| mocap actual",
         )
         ax.plot(ts, array(values, "pursuer_speed"), "--", label="||uO_cmd||")
-        style_axis(ax, "MATLAB target and pursuer speeds", "speed (m/s)")
+        style_axis(ax, "Command and position-difference speeds", "m/s")
 
         ax = axes[1, 1]
         ax.clear()
-        ax.plot(ts, array(values, "range_value"), label="||r|| actual range")
-        ax.axhline(
-            desired_range, color="tab:blue", linestyle="--", alpha=0.65,
-            label=f"||rd|| = Rd = {desired_range:.2f} m",
-        )
-        style_axis(ax, "Actual and desired relative range", "range (m)")
+        ax.step(ts, array(values, "active_directions"), where="post",
+            label="active RBF directions")
+        ax.step(ts, array(values, "history_count"), where="post",
+            label="history windows")
+        style_axis(ax, "History-stack excitation", "count")
 
     def draw_engineering_analysis(values, ts) -> None:
         """显示 MATLAB 理想模型与实车之间最可能产生差异的量。"""
@@ -823,7 +953,8 @@ def realtime_plot_process(
         ax2.semilogy(ts, np.maximum(max_eigenvalue, 1.0e-14), ":",
                      color="tab:red", label="max eigenvalue")
         ax.set_title("History-stack excitation spectrum")
-        ax.set_xlabel("time from now (s)")
+        ax.set_xlabel("time (s)")
+        ax.set_xlim(0.0, max(float(columns["t"][-1]), 0.02))
         ax.set_ylabel("count")
         ax2.set_ylabel("eigenvalue (log scale)")
         ax.grid(True, alpha=0.7)
@@ -843,65 +974,16 @@ def realtime_plot_process(
                 label="pursuer velocity fit span")
         style_axis(ax, "Timing and mocap freshness", "time (ms)")
 
-    while plt.fignum_exists(figure.number) or plt.fignum_exists(analysis_figure.number):
-        stop_requested = False
-        try:
-            item = samples.get(timeout=0.1)
-            if item is None:
-                break
-            data.append(item)
-            while True:
-                item = samples.get_nowait()
-                if item is None:
-                    stop_requested = True
-                    break
-                data.append(item)
-        except queue.Empty:
-            pass
-
-        if stop_requested:
-            break
-        now = time.monotonic()
-        if not data or now - last_draw < 0.10:
-            plt.pause(0.01)
-            continue
-        last_draw = now
-        values = list(data)
-        t0 = values[-1].t
-        ts = array(values, "t") - t0
-
-        if plt.fignum_exists(figure.number):
-            draw_matlab_comparison(values, ts)
-            figure.tight_layout()
-            figure.canvas.draw_idle()
-        if plt.fignum_exists(analysis_figure.number):
-            draw_engineering_analysis(values, ts)
-            analysis_figure.tight_layout()
-            analysis_figure.canvas.draw_idle()
-        plt.pause(0.01)
-
-        if now - last_save >= 1.0:
-            # 根目录两张图作为“最新实验”预览；时间戳实验目录同步保存同一版本，
-            # 即使程序异常退出，也尽量保留最近一次已经画出的历史图。
-            for target_figure, path in (
-                (figure, save_path),
-                (analysis_figure, analysis_save_path),
-                (figure, archive_plot_path),
-                (analysis_figure, archive_analysis_path),
-            ):
-                save_figure(target_figure, path)
-            last_save = now
-
-    if data:
-        # 退出前再画/保存一次，实验目录中的图不会被下一次实验覆盖。
-        values = list(data)
-        ts = array(values, "t") - values[-1].t
+    if columns["t"]:
+        values = columns
+        ts = array(values, "t")
         draw_matlab_comparison(values, ts)
         draw_engineering_analysis(values, ts)
         figure.tight_layout()
         analysis_figure.tight_layout()
         for target_figure, path in (
             (figure, save_path),
+            (figure, comparison_save_path),
             (analysis_figure, analysis_save_path),
             (figure, archive_plot_path),
             (analysis_figure, archive_analysis_path),
@@ -936,6 +1018,10 @@ class Parameters:
 
     # ---------- 当前窗/历史栈辨识器：论文式 (11)-(24) ----------
     nh: int = 30              # 最多保留的完整历史窗口数量
+    max_history_execution_error: float = 0.0  # 历史窗允许的最大执行误差 RMS；0 禁用
+    max_history_target_execution_error: float = 0.0  # 目标侧命令-动捕执行误差门限；0 禁用
+    history_forgetting_factor: float = 1.0  # 每接受一个窗口对历史栈应用的指数遗忘；1 禁用
+    identifier_use_relative_velocity: bool = False  # 窗口回归目标是否含动捕相对速度
     gamma: float = 1.0e-3     # 昨天实车实验的激活特征值阈值
     ac: float = 1.0e-5        # 当前窗口可参与在线更新的激活阈值
     valid_tol: float = 100.0 * np.finfo(float).eps  # 完整窗口有效性阈值
@@ -949,6 +1035,8 @@ class Parameters:
     lambda_s: float = 0.10    # Riccati 方程中的稳定化参数（本次实车测试值）
     ro: float = 0.02          # 观测噪声权重 R_o = ro * I
     p_floor: float = 1.0e-9   # P_o 投影为正定矩阵时的最小特征值
+    mocap_position_observer_gain: float = 0.0
+    mocap_relative_velocity_observer_gain: float = 0.0
 
     @property
     def n(self) -> int:
@@ -1025,6 +1113,12 @@ class HistoryStack:
                 self.windows[replacement] = w_new.copy()
                 self.vectors[replacement] = z_new.copy()
 
+        if self.p.history_forgetting_factor < 1.0:
+            factor = self.p.history_forgetting_factor
+            for index in range(len(self.windows)):
+                self.windows[index] *= factor
+                self.vectors[index] *= factor
+
         self._recompute_projection()
 
     def _recompute_projection(self) -> None:
@@ -1087,7 +1181,22 @@ class CurrentWindow:
         self.ch = 0.0
         self.sff = np.zeros((p.nq, p.nq), dtype=float)
         self.sfh = np.zeros(p.nq, dtype=float)
+        self.execution_error_integral = 0.0
+        self.target_execution_error_integral = 0.0
+        self.duration = 0.0
         self.count = 0
+
+    def execution_error_rms(self) -> float:
+        """返回本窗指令与动捕实际速度之差的时间加权 RMS。"""
+        if self.duration <= 0.0:
+            return 0.0
+        return math.sqrt(self.execution_error_integral / self.duration)
+
+    def target_execution_error_rms(self) -> float:
+        """返回本窗目标指令与目标动捕速度之差的时间加权 RMS。"""
+        if self.duration <= 0.0:
+            return 0.0
+        return math.sqrt(self.target_execution_error_integral / self.duration)
 
     def statistics(self, threshold: float) -> Tuple[np.ndarray, np.ndarray, float]:
         """由累计量构造 (W, Z, chi)；激励不足时返回零并令 chi=0。"""
@@ -1102,12 +1211,16 @@ class CurrentWindow:
         return (w + w.T) * 0.5, z, 1.0
 
     def accumulate(self, b: np.ndarray, pb: np.ndarray, phi: np.ndarray,
-                   u_o: np.ndarray, dt: float) -> None:
+                   u_ident: np.ndarray, u_o_actual: np.ndarray,
+                   u_o_command: np.ndarray, dt: float,
+                   target_execution_error: Optional[np.ndarray] = None) -> None:
         """用左矩形法累计一个样本，与 MATLAB 循环的积分顺序一致。
 
-        ``u_o`` 在实车版本中是 pursuer 的实际世界速度估计，而不是
-        ``uO_cmd``。参数 ``b`` 保留在接口中用于表明数据来源，实际公式使用
-        已计算好的投影矩阵 ``pb``。
+        ``u_ident`` 是当前窗回归目标（默认等于 pursuer 实际速度；启用相对
+        速度修正时为 Pb*(u_o+dr/dt)）。``u_o_actual`` 与 ``u_o_command`` 只用于
+        计算底盘执行质量，不进入回归方程。``target_execution_error`` 用于
+        目标侧窗口质量门，同样不进入回归方程。参数 ``b`` 保留在接口中用于
+        表明数据来源，实际公式使用已计算好的投影矩阵 ``pb``。
         """
         f = pb @ self.g
         h = pb @ self.u
@@ -1118,7 +1231,16 @@ class CurrentWindow:
         self.sff += dt * (f.T @ f)
         self.sfh += dt * (f.T @ h)
         self.g += dt * phi
-        self.u += dt * u_o
+        self.u += dt * u_ident
+        execution_error = np.asarray(u_o_command) - np.asarray(u_o_actual)
+        self.execution_error_integral += dt * float(execution_error @ execution_error)
+        if target_execution_error is not None:
+            error = np.asarray(target_execution_error, dtype=float)
+            if np.all(np.isfinite(error)):
+                self.target_execution_error_integral += dt * float(
+                    error @ error
+                )
+        self.duration += dt
         self.count += 1
 
 
@@ -1133,7 +1255,8 @@ class BearingTrackingController:
     输出 ``uO_cmd`` 是世界坐标系速度，ROS 节点在发布前再转成车体坐标系。
     """
 
-    def __init__(self, p: Parameters, b0: np.ndarray):
+    def __init__(self, p: Parameters, b0: np.ndarray,
+                 initial_relative_position: Optional[np.ndarray] = None):
         # I、J 分别是二维单位阵和逆时针旋转 90 度矩阵。
         self.p = p
         self.identity2 = np.eye(2)
@@ -1147,9 +1270,16 @@ class BearingTrackingController:
         self.theta_hat = np.zeros(p.nq, dtype=float)  # RBF 参数估计，60x1
         self.u_t_hat = np.zeros(2, dtype=float)       # 目标输入估计，2x1
         self.xi_hat = np.zeros(4, dtype=float)        # 增广相对状态估计，4x1
+        if initial_relative_position is not None:
+            self.xi_hat[0:2] = np.asarray(
+                initial_relative_position, dtype=float
+            )
         self.po = 0.30 * np.eye(4, dtype=float)       # Riccati 矩阵，4x4
         self.history = HistoryStack(p)
         self.window = CurrentWindow(b0, p)
+        self.last_history_window_execution_error = 0.0
+        self.last_history_target_execution_error = 0.0
+        self.last_history_window_accepted = 0
 
     def rbf_regressor(self, b: np.ndarray) -> np.ndarray:
         """计算论文式 (4) 的块对角 RBF 回归矩阵 Phi(b)，尺寸 2x60。"""
@@ -1178,7 +1308,10 @@ class BearingTrackingController:
 
     def step(self, t: float, b: np.ndarray, dt: float,
              u_o_actual: np.ndarray,
-             relative_position_feedback: Optional[np.ndarray] = None
+             relative_position_feedback: Optional[np.ndarray] = None,
+             u_ident: Optional[np.ndarray] = None,
+             relative_velocity_feedback: Optional[np.ndarray] = None,
+             target_execution_error: Optional[np.ndarray] = None,
              ) -> Tuple[np.ndarray, dict]:
         """推进一次辨识器/观测器，并返回世界系 pursuer 指令。
 
@@ -1193,6 +1326,9 @@ class BearingTrackingController:
         b = b / max(float(np.linalg.norm(b)), 1.0e-12)
         pb, phi, rd, rd_dot = self.signals(t, b)
         wc, zc, chi = self.window.statistics(p.ac)
+        identifier_terms = self._identifier_terms(
+            phi, self.theta_hat, wc, zc, chi
+        )
 
         # 论文式 (63)：
         # uO = uT_hat + xiHat_v - rdDot + Kr(xiHat_r-rd)，
@@ -1218,22 +1354,34 @@ class BearingTrackingController:
         # 这里只得到“要求底盘执行”的指令；实际执行速度另由动捕估计。
         u_o_cmd = limit_vector_norm(u_o_raw, p.max_linear_speed)
         u_o_actual = np.asarray(u_o_actual, dtype=float)
+        u_ident = (
+            u_o_actual if u_ident is None
+            else np.asarray(u_ident, dtype=float)
+        )
 
         # RK4 同时积分 thetaHat、uTHat、xiHat、Po。一个采样周期内把方位、
         # 当前窗统计量和实测自速度视为零阶保持量，与离散实时控制相对应。
         state = (self.theta_hat.copy(), self.u_t_hat.copy(),
                  self.xi_hat.copy(), self.po.copy())
-        k1 = self._derivatives(t, b, *state, wc, zc, chi, u_o_actual)
+        k1 = self._derivatives(
+            t, b, *state, wc, zc, chi, u_o_actual,
+            relative_position_feedback, relative_velocity_feedback,
+        )
         k2_state = self._add_state(state, k1, 0.5 * dt)
         k2 = self._derivatives(
-            t + 0.5 * dt, b, *k2_state, wc, zc, chi, u_o_actual
+            t + 0.5 * dt, b, *k2_state, wc, zc, chi, u_o_actual,
+            relative_position_feedback, relative_velocity_feedback,
         )
         k3_state = self._add_state(state, k2, 0.5 * dt)
         k3 = self._derivatives(
-            t + 0.5 * dt, b, *k3_state, wc, zc, chi, u_o_actual
+            t + 0.5 * dt, b, *k3_state, wc, zc, chi, u_o_actual,
+            relative_position_feedback, relative_velocity_feedback,
         )
         k4_state = self._add_state(state, k3, dt)
-        k4 = self._derivatives(t + dt, b, *k4_state, wc, zc, chi, u_o_actual)
+        k4 = self._derivatives(
+            t + dt, b, *k4_state, wc, zc, chi, u_o_actual,
+            relative_position_feedback, relative_velocity_feedback,
+        )
         increment = tuple(
             dt * (a + 2.0 * b_ + 2.0 * c + d) / 6.0
             for a, b_, c, d in zip(k1, k2, k3, k4)
@@ -1242,11 +1390,31 @@ class BearingTrackingController:
         self.theta_hat, self.u_t_hat, self.xi_hat, self.po = updated
         self.po = self.project_spd(self.po, p.p_floor)
 
-        # 用当前样本完成有限窗口积分。达到 Nw 个样本后加入历史栈并重置窗口。
-        self.window.accumulate(b, pb, phi, u_o_actual, dt)
+        # 用当前样本完成有限窗口积分。达到 Nw 个样本后经质量门加入历史栈。
+        # 回归目标默认是 Pb*uO；启用相对速度修正时拟合 Pb*(uO+dr/dt)=Pb*uT。
+        # 执行质量始终按命令与实际速度之差计算，不随回归目标改变。
+        self.window.accumulate(
+            b, pb, phi, u_ident, u_o_actual, u_o_cmd, dt,
+            target_execution_error=target_execution_error,
+        )
         if self.window.count >= p.nw:
             w_new, z_new, valid = self.window.statistics(p.valid_tol)
-            if valid > 0.0:
+            self.last_history_window_execution_error = self.window.execution_error_rms()
+            self.last_history_target_execution_error = (
+                self.window.target_execution_error_rms()
+            )
+            self.last_history_window_accepted = int(
+                valid > 0.0 and (
+                    p.max_history_execution_error <= 0.0
+                    or self.last_history_window_execution_error
+                    <= p.max_history_execution_error
+                ) and (
+                    p.max_history_target_execution_error <= 0.0
+                    or self.last_history_target_execution_error
+                    <= p.max_history_target_execution_error
+                )
+            )
+            if self.last_history_window_accepted:
                 self.history.add(w_new, z_new)
             self.window = CurrentWindow(b, p)
 
@@ -1281,6 +1449,27 @@ class BearingTrackingController:
             "control_feedback_position": feedback_position,
             "control_feedback_uses_mocap": int(feedback_uses_mocap),
             "theta_hat_norm": float(np.linalg.norm(self.theta_hat)),
+            "identifier_current_theta_dot_norm": float(np.linalg.norm(
+                identifier_terms["current_theta_dot"]
+            )),
+            "identifier_history_theta_dot_norm": float(np.linalg.norm(
+                identifier_terms["history_theta_dot"]
+            )),
+            "identifier_leak_theta_dot_norm": float(np.linalg.norm(
+                identifier_terms["leak_theta_dot"]
+            )),
+            "identifier_current_output_rate": identifier_terms[
+                "current_output_rate"
+            ].copy(),
+            "identifier_history_output_rate": identifier_terms[
+                "history_output_rate"
+            ].copy(),
+            "identifier_leak_output_rate": identifier_terms[
+                "leak_output_rate"
+            ].copy(),
+            "identifier_total_output_rate": identifier_terms[
+                "total_output_rate"
+            ].copy(),
             "xi_position_norm": float(np.linalg.norm(self.xi_hat[0:2])),
             "xi_velocity_norm": float(np.linalg.norm(self.xi_hat[2:4])),
             "po_min_eigenvalue": po_min,
@@ -1295,22 +1484,26 @@ class BearingTrackingController:
             "current_window_count": self.window.count,
             "current_window_excitation": float(self.window.a),
             "chi": chi,
+            "history_last_window_execution_error": (
+                self.last_history_window_execution_error
+            ),
+            "history_last_window_accepted": self.last_history_window_accepted,
         }
         return u_o_cmd, diagnostics
 
     def _derivatives(self, t: float, b: np.ndarray, theta_hat: np.ndarray,
                      u_t_hat: np.ndarray, xi_hat: np.ndarray, po: np.ndarray,
                      wc: np.ndarray, zc: np.ndarray, chi: float,
-                     u_o_actual: np.ndarray):
+                     u_o_actual: np.ndarray,
+                     relative_position_feedback: Optional[np.ndarray],
+                     relative_velocity_feedback: Optional[np.ndarray]):
         """论文式 (24)、(46)、(50)、(51) 的连续时间右端项。"""
         p = self.p
         pb, phi, rd, rd_dot = self.signals(t, b)
         # 参数估计器：当前窗口项 + 历史栈项 + 未激活方向泄漏项。
-        theta_dot = (
-            p.kc * chi * (zc - wc @ theta_hat)
-            + p.kh * (self.history.theta_gamma - self.history.pi @ theta_hat)
-            - p.sigma_theta * (self.identity_nq - self.history.pi) @ theta_hat
-        )
+        theta_dot = self._identifier_terms(
+            phi, theta_hat, wc, zc, chi
+        )["total_theta_dot"]
         # RBF 输出经一阶滤波形成平滑的目标速度估计 uT_hat。
         u_t_hat_dot = p.af * (phi @ theta_hat - u_t_hat)
 
@@ -1325,7 +1518,46 @@ class BearingTrackingController:
             + p.lambda_s * po - po @ co.T @ ro_inv @ co @ po
         )
         xi_dot = self._ao() @ xi_hat + go + lo @ (-co @ xi_hat)
+        if (relative_position_feedback is not None
+                and p.mocap_position_observer_gain > 0.0):
+            xi_dot[0:2] += p.mocap_position_observer_gain * (
+                np.asarray(relative_position_feedback, dtype=float) - xi_hat[0:2]
+            )
+        if (relative_velocity_feedback is not None
+                and p.mocap_relative_velocity_observer_gain > 0.0):
+            predicted_relative_velocity = (
+                u_t_hat - u_o_actual + xi_hat[2:4]
+            )
+            xi_dot[2:4] += p.mocap_relative_velocity_observer_gain * (
+                np.asarray(relative_velocity_feedback, dtype=float)
+                - predicted_relative_velocity
+            )
         return theta_dot, u_t_hat_dot, xi_dot, po_dot
+
+    def _identifier_terms(self, phi: np.ndarray, theta_hat: np.ndarray,
+                          wc: np.ndarray, zc: np.ndarray, chi: float) -> dict:
+        """分解参数更新项，供诊断各项对目标速度估计的驱动。"""
+        p = self.p
+        current_theta_dot = p.kc * chi * (zc - wc @ theta_hat)
+        history_theta_dot = p.kh * (
+            self.history.theta_gamma - self.history.pi @ theta_hat
+        )
+        leak_theta_dot = -p.sigma_theta * (
+            self.identity_nq - self.history.pi
+        ) @ theta_hat
+        total_theta_dot = (
+            current_theta_dot + history_theta_dot + leak_theta_dot
+        )
+        return {
+            "current_theta_dot": current_theta_dot,
+            "history_theta_dot": history_theta_dot,
+            "leak_theta_dot": leak_theta_dot,
+            "total_theta_dot": total_theta_dot,
+            "current_output_rate": phi @ current_theta_dot,
+            "history_output_rate": phi @ history_theta_dot,
+            "leak_output_rate": phi @ leak_theta_dot,
+            "total_output_rate": phi @ total_theta_dot,
+        }
 
     @staticmethod
     def _add_state(state, derivative, scale: float):
@@ -1423,17 +1655,16 @@ class EvasiveTargetController:
         return command
 
 
-class BearingTrackingNode(Node):
-    """ROS 2 外层：收发话题、估计 pursuer 自速度并调用核心控制器。
+class BearingTrackingNode:
+    """ROS 1 外层：收发话题、估计 pursuer 自速度并调用核心控制器。
 
     默认数据流：
       /robot04/pose -> target 动捕位姿
       /robot03/pose -> pursuer 动捕位姿和实际速度拟合
-      世界系算法输出 -> yaw 旋转 -> /robotXX/vel_cmd 车体系指令
+    世界系算法输出 -> yaw 旋转 -> /robotXX/cmd_vel 车体系指令
     """
 
     def __init__(self, args: argparse.Namespace):
-        super().__init__("bearing_tracking_direct_v1")
         self.args = args
         # 把命令行中的实验参数写入论文参数结构。这里的 dt 是名义周期，
         # 实际每次积分仍使用定时器测得并限幅后的 dt。
@@ -1448,6 +1679,12 @@ class BearingTrackingNode(Node):
             q=args.rbf_count,
             sigma=args.rbf_sigma,
             nh=args.history_size,
+            max_history_execution_error=args.max_history_execution_error,
+            max_history_target_execution_error=(
+                args.max_history_target_execution_error
+            ),
+            history_forgetting_factor=args.history_forgetting_factor,
+            identifier_use_relative_velocity=args.identifier_use_relative_velocity,
             gamma=args.gamma,
             ac=args.current_window_threshold,
             valid_tol=args.window_valid_tolerance,
@@ -1459,6 +1696,10 @@ class BearingTrackingNode(Node):
             lambda_s=args.riccati_lambda,
             ro=args.observer_noise_weight,
             p_floor=args.riccati_eigenvalue_floor,
+            mocap_position_observer_gain=args.mocap_position_observer_gain,
+            mocap_relative_velocity_observer_gain=(
+                args.mocap_relative_velocity_observer_gain
+            ),
         )
         # MATLAB 要求 DeltaT/dt 为整数；在创建定时器前先验证。
         _ = self.p.nw
@@ -1483,10 +1724,13 @@ class BearingTrackingNode(Node):
         )
         # 控制器时钟与 ROS 数据超时管理。
         self.start_time: Optional[float] = None
+        self.experiment_complete = threading.Event()
+        self.stopped = False
         self.last_control_time: Optional[float] = None
         self.last_log_time = 0.0
         self.stale_timeout = args.stale_timeout
-        self.body_yaw_offset = math.radians(args.body_yaw_offset_deg)
+        self.mocap_velocity_alignment_delay = args.mocap_velocity_alignment_delay
+        self.bearing_history = deque(maxlen=256)
         # 两辆车使用完全相同的动捕速度估计器。只有 pursuer 的结果进入算法；
         # target 的结果专门用于检验 MATLAB 中“速度指令立即实现”的理想假设。
         self.pursuer_velocity_estimator = MocapVelocityEstimator(
@@ -1499,22 +1743,26 @@ class BearingTrackingNode(Node):
             args.mocap_velocity_filter_tau,
             args.mocap_max_valid_speed,
         )
+        # 相对位置速度估计：窗口回归目标 Pb*(uO+dr/dt) 所需的 dr/dt。
+        self.relative_velocity_estimator = MocapVelocityEstimator(
+            args.mocap_velocity_window,
+            args.mocap_velocity_filter_tau,
+            2.0 * args.mocap_max_valid_speed,
+        )
 
         # 根据车辆 ID 和可选话题覆盖参数生成实际订阅/发布话题。
         target_name = robot_name(args.target_id)
         pursuer_name = robot_name(args.pursuer_id)
         target_topic = args.target_pose_topic or f"/{target_name}/pose"
         pursuer_topic = args.pursuer_pose_topic or f"/{pursuer_name}/pose"
-        vel_topic = args.vel_topic or f"/{pursuer_name}/vel_cmd"
-        target_vel_topic = args.target_vel_topic or f"/{target_name}/vel_cmd"
+        vel_topic = args.vel_topic or f"/{pursuer_name}/cmd_vel"
+        target_vel_topic = args.target_vel_topic or f"/{target_name}/cmd_vel"
 
         # 诊断通道与控制通道解耦：队列满时丢诊断帧，不等待绘图或终端输出。
         self.telemetry_queue: Optional[queue.Queue] = None
         self.telemetry_worker: Optional[ConsoleTelemetryWorker] = None
         self.recorder_queue: Optional[queue.Queue] = None
         self.recorder_worker: Optional[DiagnosticsRecorderWorker] = None
-        self.plot_queue = None
-        self.plot_process = None
         self.session_dir: Optional[str] = None
 
         # 后台文本诊断线程。
@@ -1531,7 +1779,9 @@ class BearingTrackingNode(Node):
             self.session_dir = os.path.abspath(os.path.join(args.data_dir, session_name))
             metadata = {
                 "created_at": datetime.now().astimezone().isoformat(),
-                "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", "0"),
+                "ros_master_uri": os.environ.get(
+                    "ROS_MASTER_URI", "http://localhost:11311"
+                ),
                 "arguments": vars(args),
                 "algorithm_parameters": asdict(self.p),
                 "roles": {"target": target_name, "pursuer": pursuer_name},
@@ -1548,63 +1798,53 @@ class BearingTrackingNode(Node):
             }
             self.recorder_queue = queue.Queue(maxsize=4096)
             self.recorder_worker = DiagnosticsRecorderWorker(
-                self.recorder_queue, self.session_dir, metadata
+                self.recorder_queue, self.session_dir, metadata,
+                args.save_comparison_plot,
+                args.save_plot,
+                args.save_analysis_plot,
+                args.plot,
             )
             self.recorder_worker.start()
 
-        # GUI 必须放入独立进程，避免 matplotlib 事件循环阻塞 ROS。
-        if args.plot:
-            context = mp.get_context("spawn")
-            self.plot_queue = context.Queue(maxsize=512)
-            self.plot_process = context.Process(
-                target=realtime_plot_process,
-                args=(
-                    self.plot_queue,
-                    args.plot_history,
-                    args.relative_radius,
-                    args.save_plot,
-                    args.save_analysis_plot,
-                    (
-                        os.path.join(self.session_dir, "tracking_diagnostics.png")
-                        if self.session_dir else None
-                    ),
-                    (
-                        os.path.join(self.session_dir, "tracking_analysis.png")
-                        if self.session_dir else None
-                    ),
-                ),
-                name="bearing-tracking-plot",
-                daemon=True,
-            )
-            self.plot_process.start()
+        # ROS 1 队列深度 20：动捕和速度均只关心近期数据。
+        self.target_subscription = rospy.Subscriber(
+            target_topic, PoseStamped, self._target_callback, queue_size=20
+        )
+        self.pursuer_subscription = rospy.Subscriber(
+            pursuer_topic, PoseStamped, self._pursuer_callback, queue_size=20
+        )
+        self.velocity_publisher = rospy.Publisher(vel_topic, Twist, queue_size=20)
+        self.target_velocity_publisher = rospy.Publisher(
+            target_vel_topic, Twist, queue_size=20
+        )
+        self.control_timer = rospy.Timer(
+            rospy.Duration(1.0 / args.rate), self.control_callback
+        )
 
-        # ROS QoS 深度 20：动捕和速度均只关心近期数据。
-        self.create_subscription(PoseStamped, target_topic, self._target_callback, 20)
-        self.create_subscription(PoseStamped, pursuer_topic, self._pursuer_callback, 20)
-        self.velocity_publisher = self.create_publisher(TwistStamped, vel_topic, 20)
-        self.target_velocity_publisher = self.create_publisher(TwistStamped, target_vel_topic, 20)
-        self.create_timer(1.0 / args.rate, self.control_callback)
-
-        self.get_logger().info(f"target pose:  {target_topic}")
-        self.get_logger().info(f"pursuer pose: {pursuer_topic}")
-        self.get_logger().info(f"velocity cmd: {vel_topic}")
-        self.get_logger().info(f"config file:  {args.config}")
-        self.get_logger().info(f"target cmd:   {target_vel_topic}")
-        self.get_logger().info(
+        rospy.loginfo(f"target pose:  {target_topic}")
+        rospy.loginfo(f"pursuer pose: {pursuer_topic}")
+        rospy.loginfo(f"velocity cmd: {vel_topic}")
+        rospy.loginfo(f"config file:  {args.config}")
+        rospy.loginfo(f"target cmd:   {target_vel_topic}")
+        rospy.loginfo(
+            "experiment duration: %s",
+            f"{args.duration:g} s from controller initialization" if args.duration > 0.0
+            else "manual stop with Ctrl+C",
+        )
+        rospy.loginfo(
             f"rate={args.rate:.1f} Hz, window={args.window:.2f} s, "
             f"rd={args.relative_radius:.2f} m, wd={args.relative_angular_speed:.2f} rad/s, "
             f"Kr={args.tracking_gain:.3g}I, "
             f"target law vd={args.target_vd:.2f}, ve={args.target_ve:.2f}, "
-            f"vj={args.target_vj:.2f} m/s, "
-            f"body yaw offset={args.body_yaw_offset_deg:.1f} deg"
+            f"vj={args.target_vj:.2f} m/s"
         )
-        self.get_logger().info(
+        rospy.loginfo(
             f"history identifier: gamma={args.gamma:.2e}, "
             f"kh={args.history_gain:.3g}, "
             f"condition gate="
             f"{'disabled' if args.max_history_condition == 0.0 else f'{args.max_history_condition:.2e}'}"
         )
-        self.get_logger().info(
+        rospy.loginfo(
             "tracking feedback position: %s"
             % (
                 "direct mocap r=pT-pO (hybrid mode)"
@@ -1613,7 +1853,7 @@ class BearingTrackingNode(Node):
             )
         )
         if args.target_soft_boundary:
-            self.get_logger().info(
+            rospy.loginfo(
                 "target soft boundary: x=[%.2f, %.2f], y=[%.2f, %.2f] m, "
                 "margin=%.2f m, correction<=%.2f m/s per axis"
                 % (
@@ -1626,25 +1866,29 @@ class BearingTrackingNode(Node):
             "disabled" if args.mocap_max_valid_speed == 0.0
             else f"<={args.mocap_max_valid_speed:.2f} m/s"
         )
-        self.get_logger().info(
+        rospy.loginfo(
             "identifier/observer uO source: mocap regression velocity "
             f"(window={args.mocap_velocity_window:.3f} s, "
             f"tau={args.mocap_velocity_filter_tau:.3f} s, "
             f"valid-speed gate={speed_gate})"
         )
+        rospy.loginfo(
+            "identifier bearing alignment delay: "
+            f"{args.mocap_velocity_alignment_delay:.3f} s"
+        )
         if args.telemetry_period > 0.0:
-            self.get_logger().info(
+            rospy.loginfo(
                 f"console telemetry every {args.telemetry_period:.1f} s"
             )
         if args.plot:
-            self.get_logger().info(
-                f"MATLAB comparison plot: {args.save_plot}"
+            rospy.loginfo(
+                f"full-run comparison plot saved after experiment: {args.save_plot}"
             )
-            self.get_logger().info(
-                f"real-system analysis plot: {args.save_analysis_plot}"
+            rospy.loginfo(
+                f"full-run analysis plot saved after experiment: {args.save_analysis_plot}"
             )
         if self.session_dir:
-            self.get_logger().info(f"experiment data directory: {self.session_dir}")
+            rospy.loginfo(f"experiment data directory: {self.session_dir}")
 
     @staticmethod
     def _pose_to_cache(msg: PoseStamped) -> PoseCache:
@@ -1660,7 +1904,7 @@ class BearingTrackingNode(Node):
             float(orientation.z), float(orientation.w),
         )
         stamp = msg.header.stamp
-        sample_time = float(stamp.sec) + 1.0e-9 * float(stamp.nanosec)
+        sample_time = float(stamp.secs) + 1.0e-9 * float(stamp.nsecs)
         if sample_time <= 0.0:
             sample_time = receive_time
         return PoseCache(
@@ -1695,16 +1939,14 @@ class BearingTrackingNode(Node):
         self._publish_velocity(self.target_velocity_publisher, velocity_body)
 
     def _publish_velocity(self, publisher, velocity_body: np.ndarray) -> None:
-        """组装 TwistStamped；全向底盘使用 linear.x/y，航向角速度保持 0。"""
-        msg = TwistStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "base_link"
-        msg.twist.linear.x = float(velocity_body[0])
-        msg.twist.linear.y = float(velocity_body[1])
-        msg.twist.linear.z = 0.0
-        msg.twist.angular.x = 0.0
-        msg.twist.angular.y = 0.0
-        msg.twist.angular.z = 0.0
+        """组装 Twist；只发布车体系平移，角速度固定为零。"""
+        msg = Twist()
+        msg.linear.x = float(velocity_body[0])
+        msg.linear.y = float(velocity_body[1])
+        msg.linear.z = 0.0
+        msg.angular.x = 0.0
+        msg.angular.y = 0.0
+        msg.angular.z = 0.0
         publisher.publish(msg)
 
     def update_target_motion(self, now: float) -> None:
@@ -1729,7 +1971,7 @@ class BearingTrackingNode(Node):
         bearing = relative / range_value
         world_velocity = self.target_evasion.command(bearing, self.target.position)
         body_velocity = world_to_body(
-            world_velocity, self.target.yaw + self.body_yaw_offset
+            world_velocity, self.target.yaw
         )
         self.publish_target_velocity(body_velocity)
 
@@ -1744,9 +1986,8 @@ class BearingTrackingNode(Node):
             pass
 
     def publish_telemetry(self, sample: TelemetrySample) -> None:
-        """把同一诊断帧送往终端、绘图和记录器，三者均不阻塞控制。"""
+        """把诊断帧送往终端和完整记录器，不阻塞控制。"""
         self._try_enqueue(self.telemetry_queue, sample)
-        self._try_enqueue(self.plot_queue, sample)
         self._try_enqueue(self.recorder_queue, sample)
 
     def reset_pursuer_velocity_measurement(self) -> None:
@@ -1757,6 +1998,35 @@ class BearingTrackingNode(Node):
         """同时清除两车速度历史，用于启动和动捕中断后的干净重启。"""
         self.pursuer_velocity_estimator.reset()
         self.target_velocity_estimator.reset()
+        self.relative_velocity_estimator.reset()
+
+    def reset_bearing_alignment(self) -> None:
+        """清除方位历史，避免动捕中断后将旧方位配给新速度。"""
+        self.bearing_history.clear()
+
+    def aligned_bearing(self, now: float, bearing: np.ndarray) -> Optional[np.ndarray]:
+        """返回与因果动捕速度估计同一时刻的历史方位。
+
+        最近位置窗的速度估计代表稍早的运动；用等量延迟的方位构造投影和
+        RBF 回归量，避免把过去速度与当前方位错配。反馈位置和期望轨迹仍使用
+        当前时刻，控制输出不额外引入整窗延迟。
+        """
+        self.bearing_history.append((now, bearing.copy()))
+        if self.mocap_velocity_alignment_delay <= 0.0:
+            return bearing
+        target_time = now - self.mocap_velocity_alignment_delay
+        while (len(self.bearing_history) >= 2
+               and self.bearing_history[1][0] <= target_time):
+            self.bearing_history.popleft()
+        if not self.bearing_history or self.bearing_history[0][0] > target_time:
+            return None
+        earlier_time, earlier_bearing = self.bearing_history[0]
+        if len(self.bearing_history) == 1:
+            return earlier_bearing.copy()
+        later_time, later_bearing = self.bearing_history[1]
+        fraction = (target_time - earlier_time) / max(later_time - earlier_time, 1.0e-12)
+        aligned = earlier_bearing + fraction * (later_bearing - earlier_bearing)
+        return aligned / max(float(np.linalg.norm(aligned)), 1.0e-12)
 
     def measured_pursuer_velocity(self) -> np.ndarray:
         """由高频动捕位置拟合 pursuer 的实际世界速度。
@@ -1771,7 +2041,7 @@ class BearingTrackingNode(Node):
         """由 target 动捕位置估计实际世界速度；仅用于诊断，不反馈算法。"""
         return self.target_velocity_estimator.estimate(self.p.dt)
 
-    def control_callback(self) -> None:
+    def control_callback(self, _event=None) -> None:
         """50 Hz（默认）主控制回调。
 
         顺序非常重要：
@@ -1782,13 +2052,36 @@ class BearingTrackingNode(Node):
           5. 将世界系 uO_cmd 旋转到车体系并发布；
           6. 用动捕真值计算诊断误差，但绝不反馈这些误差。
         """
+        if self.stopped:
+            return
         now = time.monotonic()
-        # target 和 pursuer 共用同一个控制定时器，避免两个独立循环明显错拍。
-        self.update_target_motion(now)
-        if not self._fresh(self.target, now) or not self._fresh(self.pursuer, now):
+        if (self.experiment_complete.is_set()
+                or (self.args.duration > 0.0 and self.start_time is not None
+                    and now - self.start_time >= self.args.duration)):
+            # 主线程负责停止定时器和落盘；回调先停车，且不再发送运动指令。
+            self.publish_target_velocity(np.zeros(2, dtype=float))
+            self.publish_velocity(np.zeros(2, dtype=float))
+            if not self.experiment_complete.is_set():
+                rospy.loginfo("experiment duration reached; stopping and saving data")
+                self.experiment_complete.set()
+            return
+        target_fresh = self._fresh(self.target, now)
+        pursuer_fresh = self._fresh(self.pursuer, now)
+        if not target_fresh or not pursuer_fresh:
+            rospy.logwarn_throttle(
+                2.0,
+                "waiting for fresh VRPN poses: target=%s, pursuer=%s",
+                target_fresh,
+                pursuer_fresh,
+            )
             self.reset_all_velocity_measurements()
+            self.reset_bearing_alignment()
+            self.publish_target_velocity(np.zeros(2, dtype=float))
             self.publish_velocity(np.zeros(2, dtype=float))
             return
+
+        # target 和 pursuer 共用同一个控制定时器，避免两个独立循环明显错拍。
+        self.update_target_motion(now)
 
         # 真实 r、rho 在 ROS 外层可用于构造方位和诊断；核心控制器只收到 b。
         relative = self.target.position - self.pursuer.position
@@ -1798,6 +2091,10 @@ class BearingTrackingNode(Node):
             self.get_logger().warn("target and pursuer positions are coincident; bearing is undefined")
             return
         bearing = relative / range_value
+        identifier_bearing = self.aligned_bearing(now, bearing)
+        if identifier_bearing is None:
+            self.publish_velocity(np.zeros(2, dtype=float))
+            return
         # 这是 pursuer 自身实际状态估计，不是 uO_cmd，也不是 target 速度。
         mocap_velocity = self.measured_pursuer_velocity()
 
@@ -1805,10 +2102,15 @@ class BearingTrackingNode(Node):
             # 第一帧只初始化算法。清空启动前手动搬车产生的位置数据，避免污染
             # 第一个速度拟合和历史窗口；本周期给 pursuer 发送零速度。
             self.reset_all_velocity_measurements()
-            self.controller = BearingTrackingController(self.p, bearing)
+            initial_relative_position = (
+                relative if self.args.use_mocap_relative_position else None
+            )
+            self.controller = BearingTrackingController(
+                self.p, identifier_bearing, initial_relative_position
+            )
             self.start_time = now
             self.last_control_time = now
-            self.get_logger().info("received both poses; bearing controller initialized")
+            rospy.loginfo("received both poses; bearing controller initialized")
             self.publish_velocity(np.zeros(2, dtype=float))
             return
 
@@ -1818,32 +2120,49 @@ class BearingTrackingNode(Node):
         self.last_control_time = now
         dt = min(max(raw_dt, 1.0e-4), 2.0 * self.p.dt)
         elapsed = now - (self.start_time or now)
+        # 窗口回归目标默认保持论文原式 Pb*uO。相对速度修正仅在该开关打开时
+        # 才运行，关闭时本回调路径与已验证基线完全一致。
+        relative_velocity = None
+        if (self.args.identifier_use_relative_velocity
+                or self.args.mocap_relative_velocity_observer_gain > 0.0):
+            self.relative_velocity_estimator.add_pose(elapsed, relative.copy())
+            relative_velocity = self.relative_velocity_estimator.estimate(self.p.dt)
+        if self.args.identifier_use_relative_velocity:
+            u_ident = mocap_velocity + relative_velocity
+        else:
+            u_ident = mocap_velocity
+        # 目标侧执行误差用于历史窗口质量门：目标命令与动捕实际速度之差。
+        (target_command_world, target_nominal_command_world,
+         target_boundary_command_world) = self.target_evasion.command_parts(
+            bearing, self.target.position
+        )
+        target_mocap_velocity = self.measured_target_velocity()
+        target_execution_error = None
+        if np.all(np.isfinite(target_mocap_velocity)):
+            target_execution_error = target_command_world - target_mocap_velocity
         # 核心算法输出世界系 uO_cmd；这里传入的是实际自速度 mocap_velocity。
         world_velocity, diagnostics = self.controller.step(
             elapsed,
-            bearing,
+            identifier_bearing,
             dt,
             mocap_velocity,
             relative if self.args.use_mocap_relative_position else None,
+            u_ident=u_ident,
+            relative_velocity_feedback=relative_velocity,
+            target_execution_error=target_execution_error,
         )
         # 最终硬件指令再次限幅作为发布边界，然后按 pursuer 当前 yaw 转车体系。
         world_velocity = limit_vector_norm(world_velocity, self.p.max_linear_speed)
         body_velocity = world_to_body(
-            world_velocity, self.pursuer.yaw + self.body_yaw_offset
+            world_velocity, self.pursuer.yaw
         )
         self.publish_velocity(body_velocity)
 
         # 以下真实 target/relative 量只用于诊断：估计器并未收到真实目标距离、
-        # 真实相对位置或真实 target 速度。
-        (target_command_world,
-         target_nominal_command_world,
-         target_boundary_command_world) = self.target_evasion.command_parts(
-            bearing, self.target.position
-        )
+        # 真实相对位置或真实 target 速度。目标命令与实际速度已在上方提前计算。
         target_command_body = world_to_body(
-            target_command_world, self.target.yaw + self.body_yaw_offset
+            target_command_world, self.target.yaw
         )
-        target_mocap_velocity = self.measured_target_velocity()
         target_velocity_valid = self.target_velocity_estimator.have_filtered_velocity
         tracking_error = float(np.linalg.norm(relative - diagnostics["desired_relative"]))
         localization_error = float(
@@ -1911,8 +2230,8 @@ class BearingTrackingNode(Node):
             pursuer_pose_age=max(0.0, now - self.pursuer.receive_time),
             relative_x=float(relative[0]),
             relative_y=float(relative[1]),
-            bearing_x=float(bearing[0]),
-            bearing_y=float(bearing[1]),
+            bearing_x=float(identifier_bearing[0]),
+            bearing_y=float(identifier_bearing[1]),
             desired_relative_x=float(desired_relative[0]),
             desired_relative_y=float(desired_relative[1]),
             relative_estimate_x=float(relative_estimate[0]),
@@ -1974,6 +2293,39 @@ class BearingTrackingNode(Node):
             control_feedback_position_y=float(c_feedback_position[1]),
             control_feedback_uses_mocap=diagnostics["control_feedback_uses_mocap"],
             theta_hat_norm=diagnostics["theta_hat_norm"],
+            identifier_current_theta_dot_norm=diagnostics[
+                "identifier_current_theta_dot_norm"
+            ],
+            identifier_history_theta_dot_norm=diagnostics[
+                "identifier_history_theta_dot_norm"
+            ],
+            identifier_leak_theta_dot_norm=diagnostics[
+                "identifier_leak_theta_dot_norm"
+            ],
+            identifier_current_output_rate_x=float(diagnostics[
+                "identifier_current_output_rate"
+            ][0]),
+            identifier_current_output_rate_y=float(diagnostics[
+                "identifier_current_output_rate"
+            ][1]),
+            identifier_history_output_rate_x=float(diagnostics[
+                "identifier_history_output_rate"
+            ][0]),
+            identifier_history_output_rate_y=float(diagnostics[
+                "identifier_history_output_rate"
+            ][1]),
+            identifier_leak_output_rate_x=float(diagnostics[
+                "identifier_leak_output_rate"
+            ][0]),
+            identifier_leak_output_rate_y=float(diagnostics[
+                "identifier_leak_output_rate"
+            ][1]),
+            identifier_total_output_rate_x=float(diagnostics[
+                "identifier_total_output_rate"
+            ][0]),
+            identifier_total_output_rate_y=float(diagnostics[
+                "identifier_total_output_rate"
+            ][1]),
             xi_position_norm=diagnostics["xi_position_norm"],
             xi_velocity_norm=diagnostics["xi_velocity_norm"],
             po_min_eigenvalue=diagnostics["po_min_eigenvalue"],
@@ -1988,14 +2340,24 @@ class BearingTrackingNode(Node):
             current_window_count=diagnostics["current_window_count"],
             current_window_excitation=diagnostics["current_window_excitation"],
             chi=diagnostics["chi"],
+            history_last_window_execution_error=diagnostics[
+                "history_last_window_execution_error"
+            ],
+            history_last_window_accepted=diagnostics[
+                "history_last_window_accepted"
+            ],
             pursuer_velocity_sample_count=pursuer_estimator.sample_count,
             pursuer_velocity_sample_span=pursuer_estimator.sample_span,
             pursuer_velocity_sample_accepted=int(pursuer_estimator.sample_accepted),
+            target_pose_sample_time=float(self.target.sample_time),
+            pursuer_pose_sample_time=float(self.pursuer.sample_time),
+            target_velocity_timestamp_resets=target_estimator.timestamp_reset_count,
+            pursuer_velocity_timestamp_resets=pursuer_estimator.timestamp_reset_count,
         ))
 
         if now - self.last_log_time > 2.0:
             self.last_log_time = now
-            self.get_logger().info(
+            rospy.loginfo(
                 "range=%.2f m, |uO|=%.3f m/s, history=%d, active=%d, chi=%d"
                 % (
                     range_value,
@@ -2007,32 +2369,24 @@ class BearingTrackingNode(Node):
             )
 
     def stop(self) -> None:
-        """停止后台诊断并在 ROS 上下文有效时向两辆车发送零速度。"""
-        # Ctrl-C 可能先关闭 rclpy context；仅在 context 有效时使用 publisher，
-        # 避免 ``publisher's context is invalid`` 异常。
-        if self.telemetry_worker is not None:
-            self.telemetry_worker.stop()
-            self.telemetry_worker.join(timeout=1.0)
-        if self.plot_queue is not None:
-            try:
-                # Shutdown is outside the control callback, so it is safe to
-                # wait briefly for the sentinel that triggers PNG saving.
-                self.plot_queue.put(None, timeout=0.5)
-            except queue.Full:
-                pass
-        if self.plot_process is not None:
-            self.plot_process.join(timeout=8.0)
-            if self.plot_process.is_alive():
-                self.plot_process.terminate()
-        if self.recorder_worker is not None:
-            self.recorder_worker.stop()
-            # 完整 CSV 写完后还要导出四张高分辨率独立图，给后台线程足够时间。
-            self.recorder_worker.join(timeout=15.0)
-            if self.recorder_worker.is_alive():
-                print("[DATA] recorder did not finish before shutdown timeout", flush=True)
-        if rclpy.ok():
+        """停止后台诊断并在 ROS 通信仍有效时向两辆车发送零速度。"""
+        if self.stopped:
+            return
+        self.stopped = True
+        self.control_timer.shutdown()
+        # 在耗时的绘图/落盘前优先停止车辆；shutdown 回调中 ROS 可能已断开，
+        # 因此只在通信仍可用时发布。
+        if not rospy.is_shutdown():
             self.publish_velocity(np.zeros(2, dtype=float))
             self.publish_target_velocity(np.zeros(2, dtype=float))
+        if self.telemetry_worker is not None:
+            self.telemetry_worker.stop()
+            self.telemetry_worker.join(timeout=0.5)
+        if self.recorder_worker is not None:
+            self.recorder_worker.stop()
+            # 两车已收到零速度；现在等待完整 CSV/NPZ 和静态全程图保存完毕。
+            print("[DATA] finalizing full-run data and figures...", flush=True)
+            self.recorder_worker.join()
 
 
 def _load_yaml_defaults(path: str, parser: argparse.ArgumentParser) -> dict:
@@ -2051,6 +2405,8 @@ def _load_yaml_defaults(path: str, parser: argparse.ArgumentParser) -> dict:
     if not isinstance(values, dict):
         parser.error("YAML root must be a mapping of parameter names to values")
 
+    # 灯光配置由 --led-config 读取，不属于跟踪控制器的扁平参数。
+    values.pop("led_control", None)
     valid_keys = {action.dest for action in parser._actions}
     unknown = sorted(set(values) - valid_keys)
     if unknown:
@@ -2058,7 +2414,8 @@ def _load_yaml_defaults(path: str, parser: argparse.ArgumentParser) -> dict:
 
     # 相对输出路径相对于配置文件目录，而不是启动终端的当前目录。
     config_dir = os.path.dirname(absolute_path)
-    for key in ("save_plot", "save_analysis_plot", "data_dir"):
+    for key in (
+            "save_plot", "save_analysis_plot", "save_comparison_plot", "data_dir"):
         value = values.get(key)
         if isinstance(value, str) and value and not os.path.isabs(value):
             values[key] = os.path.join(config_dir, value)
@@ -2066,9 +2423,27 @@ def _load_yaml_defaults(path: str, parser: argparse.ArgumentParser) -> dict:
     return values
 
 
+def add_boolean_argument(parser: argparse.ArgumentParser, name: str,
+                         default: bool, help_text: str) -> None:
+    """添加 ``--flag`` 和 ``--no-flag``，兼容 ROS Noetic 的 Python 3.8。"""
+    option_name = name[2:]
+    destination = option_name.replace("-", "_")
+    parser.add_argument(name, dest=destination, action="store_true",
+                        default=default, help=help_text)
+    parser.add_argument(f"--no-{option_name}", dest=destination,
+                        action="store_false", help=argparse.SUPPRESS)
+
+
 def parse_args() -> argparse.Namespace:
     """先读取 YAML 默认值，再由命令行参数作临时覆盖。"""
-    parser = argparse.ArgumentParser(description="2-D bearing-only target tracking ROS 2 demo")
+    parser = argparse.ArgumentParser(description="2-D bearing-only target tracking ROS 1 demo")
+    parser.add_argument("--led-config", default=os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "bearing_tracking_params.yaml"
+    ), help="YAML file containing led_control colors, brightness and topics")
+    parser.add_argument("--leds-only", action="store_true",
+                        help="set LED colors and exit without controlling motion")
+    parser.add_argument("--no-leds", action="store_true",
+                        help="skip setting the LED colors")
     parser.add_argument(
         "--config", default=DEFAULT_CONFIG_PATH,
         help="YAML parameter file loaded at startup",
@@ -2079,9 +2454,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pursuer-pose-topic", default=None)
     parser.add_argument("--vel-topic", default=None)
     parser.add_argument("--target-vel-topic", default=None)
-    parser.add_argument("--body-yaw-offset-deg", type=float, default=0.0,
-                        help="optional mocap yaw offset in degrees; use 0 after mocap calibration")
     parser.add_argument("--rate", type=float, default=50.0, help="control/publish rate in Hz")
+    parser.add_argument("--duration", type=float, default=0.0,
+                        help="experiment seconds from controller initialization; 0 means Ctrl+C to stop")
     parser.add_argument("--window", type=float, default=1.0, help="finite data window in seconds")
     parser.add_argument(
         "--gamma", type=float, default=1.0e-3,
@@ -2114,6 +2489,18 @@ def parse_args() -> argparse.Namespace:
                         help="Gaussian RBF width sigma")
     parser.add_argument("--history-size", type=int, default=30,
                         help="maximum number Nh of completed history windows")
+    parser.add_argument(
+        "--max-history-execution-error", type=float, default=0.0,
+        help="maximum command-vs-mocap RMS for an accepted history window; 0 disables",
+    )
+    parser.add_argument(
+        "--max-history-target-execution-error", type=float, default=0.0,
+        help="maximum target command-vs-mocap RMS for an accepted window; 0 disables",
+    )
+    parser.add_argument(
+        "--history-forgetting-factor", type=float, default=1.0,
+        help="exponential forgetting applied per accepted history window; 1 disables",
+    )
     parser.add_argument("--current-window-threshold", type=float, default=1.0e-5,
                         help="active eigenvalue threshold ac for the current window")
     parser.add_argument("--window-valid-tolerance", type=float,
@@ -2125,11 +2512,9 @@ def parse_args() -> argparse.Namespace:
                         help="parameter leakage/regularization coefficient")
     parser.add_argument("--target-estimate-filter-bandwidth", type=float, default=5.0,
                         help="uT_hat first-order filter bandwidth af")
-    parser.add_argument(
-        "--use-mocap-relative-position",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="use direct mocap r=pT-pO in Kr feedback instead of observer rHat",
+    add_boolean_argument(
+        parser, "--use-mocap-relative-position", False,
+        "use direct mocap r=pT-pO in Kr feedback instead of observer rHat",
     )
     parser.add_argument("--riccati-lambda", type=float, default=0.10,
                         help="Riccati stabilizing parameter lambda_s")
@@ -2137,6 +2522,14 @@ def parse_args() -> argparse.Namespace:
                         help="observer noise weight ro")
     parser.add_argument("--riccati-eigenvalue-floor", type=float, default=1.0e-9,
                         help="minimum eigenvalue used when projecting Po to SPD")
+    parser.add_argument(
+        "--mocap-position-observer-gain", type=float, default=0.0,
+        help="hybrid-mode mocap correction gain for rHat; 0 disables it",
+    )
+    parser.add_argument(
+        "--mocap-relative-velocity-observer-gain", type=float, default=0.0,
+        help="mocap relative-velocity innovation gain for deltaVHat; 0 disables it",
+    )
     parser.add_argument("--target-vd", type=float, default=0.0,
                         help="MATLAB target law fixed-direction speed")
     parser.add_argument("--target-ve", type=float, default=0.1,
@@ -2145,9 +2538,9 @@ def parse_args() -> argparse.Namespace:
                         help="MATLAB target law tangential speed")
     parser.add_argument("--target-direction-deg", type=float, default=155.0,
                         help="MATLAB target law fixed direction in degrees")
-    parser.add_argument(
-        "--target-soft-boundary", action=argparse.BooleanOptionalAction, default=False,
-        help="enable a smooth world-frame inward velocity near the target field boundary",
+    add_boolean_argument(
+        parser, "--target-soft-boundary", False,
+        "enable a smooth world-frame inward velocity near the target field boundary",
     )
     parser.add_argument("--field-x-min", type=float, default=-1.5)
     parser.add_argument("--field-x-max", type=float, default=1.5)
@@ -2164,24 +2557,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mocap-velocity-filter-tau", type=float, default=0.02,
                         help="low-pass time constant for measured pursuer velocity; 0 disables filtering")
     parser.add_argument(
+        "--mocap-velocity-alignment-delay", type=float, default=0.0,
+        help="delay bearing used by identifier to align it with causal mocap velocity",
+    )
+    add_boolean_argument(
+        parser, "--identifier-use-relative-velocity", False,
+        "use u_o plus mocap relative velocity as the identifier window target",
+    )
+    parser.add_argument(
         "--mocap-max-valid-speed", type=float, default=0.8,
         help="reject larger mocap-derived speeds; 0 disables this rejection",
     )
     parser.add_argument("--telemetry-period", type=float, default=1.0,
                         help="console diagnostics period in seconds; 0 disables it")
-    parser.add_argument(
-        "--plot", action=argparse.BooleanOptionalAction, default=True,
-        help="show realtime diagnostics by default; use --no-plot to disable GUI",
+    add_boolean_argument(parser, "--recording-filter", True,
+                         "exclude poor sensor/timing samples from cleaned exports and plots")
+    parser.add_argument("--recording-max-pose-age", type=float, default=0.02)
+    parser.add_argument("--recording-min-velocity-span-ratio", type=float, default=0.5)
+    parser.add_argument("--recording-recovery-time", type=float, default=0.15)
+    add_boolean_argument(
+        parser, "--plot", True,
+        "save full-run figures after the experiment; --no-plot disables figures",
     )
     parser.add_argument("--plot-history", type=float, default=30.0,
-                        help="seconds retained in the realtime plot")
+                        help="legacy option; saved plots always cover the complete run")
     parser.add_argument("--save-plot", default=DEFAULT_PLOT_PATH,
-                        help="MATLAB-comparison PNG; refreshed once per second")
+                        help="full-run comparison PNG saved after the experiment")
     parser.add_argument("--save-analysis-plot", default=DEFAULT_ANALYSIS_PLOT_PATH,
-                        help="real-system analysis PNG; refreshed once per second")
-    parser.add_argument(
-        "--save-data", action=argparse.BooleanOptionalAction, default=True,
-        help="save full CSV/NPZ/metadata by default; use --no-save-data to disable",
+                        help="full-run analysis PNG saved after the experiment")
+    parser.add_argument("--save-comparison-plot", default=DEFAULT_COMPARISON_PLOT_PATH,
+                        help="full-run simulation-style PNG; saved when the experiment stops")
+    add_boolean_argument(
+        parser, "--save-data", True,
+        "save full CSV/NPZ/metadata by default; use --no-save-data to disable",
     )
     parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR,
                         help="parent directory for timestamped experiment data")
@@ -2197,8 +2605,23 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """参数校验、ROS 初始化、spin 和安全退出入口。"""
     args = parse_args()
+    from tianbot_led_control import load_led_commands, publish_led_commands
+    led_commands, led_timeout = (
+        ([], 0.0) if args.no_leds else load_led_commands(args.led_config)
+    )
+    if args.leds_only:
+        rospy.init_node("tianbot_set_leds")
+        publish_led_commands(led_commands, led_timeout)
+        return
     if args.rate <= 0.0 or args.window <= 0.0:
         raise ValueError("rate and window must be positive")
+    if (not math.isfinite(args.recording_max_pose_age) or args.recording_max_pose_age <= 0
+            or not math.isfinite(args.recording_min_velocity_span_ratio)
+            or not 0 < args.recording_min_velocity_span_ratio <= 1
+            or not math.isfinite(args.recording_recovery_time) or args.recording_recovery_time < 0):
+        raise ValueError("invalid recording quality thresholds")
+    if not math.isfinite(args.duration) or args.duration < 0.0:
+        raise ValueError("duration must be finite and non-negative; 0 means manual stop")
     if args.max_speed < 0.0:
         raise ValueError("max-speed must be non-negative; use 0 to disable saturation")
     if args.tracking_gain < 0.0:
@@ -2209,6 +2632,14 @@ def main() -> None:
         raise ValueError("history-gain and max-history-condition must be non-negative")
     if args.rbf_count <= 0 or args.rbf_sigma <= 0.0 or args.history_size <= 0:
         raise ValueError("rbf-count, rbf-sigma and history-size must be positive")
+    if args.max_history_execution_error < 0.0:
+        raise ValueError("max-history-execution-error must be non-negative")
+    if args.max_history_target_execution_error < 0.0:
+        raise ValueError(
+            "max-history-target-execution-error must be non-negative"
+        )
+    if not 0.0 < args.history_forgetting_factor <= 1.0:
+        raise ValueError("history-forgetting-factor must be in (0, 1]")
     if args.current_window_threshold < 0.0 or args.window_valid_tolerance < 0.0:
         raise ValueError("window thresholds must be non-negative")
     if args.current_window_gain < 0.0 or args.sigma_theta < 0.0:
@@ -2219,10 +2650,18 @@ def main() -> None:
         raise ValueError("riccati-lambda and observer-noise-weight must be positive")
     if args.riccati_eigenvalue_floor <= 0.0:
         raise ValueError("riccati-eigenvalue-floor must be positive")
+    if args.mocap_position_observer_gain < 0.0:
+        raise ValueError("mocap-position-observer-gain must be non-negative")
+    if args.mocap_relative_velocity_observer_gain < 0.0:
+        raise ValueError(
+            "mocap-relative-velocity-observer-gain must be non-negative"
+        )
     if args.telemetry_period < 0.0 or args.plot_history <= 0.0:
         raise ValueError("telemetry-period must be non-negative and plot-history positive")
     if args.mocap_velocity_window <= 0.0:
         raise ValueError("mocap-velocity-window must be positive")
+    if args.mocap_velocity_alignment_delay < 0.0:
+        raise ValueError("mocap-velocity-alignment-delay must be non-negative")
     if args.mocap_velocity_filter_tau < 0.0:
         raise ValueError("mocap-velocity-filter-tau must be non-negative")
     if args.mocap_max_valid_speed < 0.0:
@@ -2242,19 +2681,28 @@ def main() -> None:
     if args.target_boundary_speed < 0.0:
         raise ValueError("target-boundary-speed must be non-negative")
 
-    # 平台集中话题位于 Domain 0。若外部已显式设置其他 Domain，则尊重外部值。
-    os.environ.setdefault("ROS_DOMAIN_ID", "0")
-    rclpy.init()
+    # 让 KeyboardInterrupt 先进入 finally 中的 node.stop()，从而在 ROS
+    # shutdown 断开发布器前发送零速度；默认 rospy 处理顺序恰好相反。
+    rospy.init_node("bearing_tracking_direct_v1", disable_signals=True)
+    try:
+        publish_led_commands(led_commands, led_timeout)
+    except RuntimeError as error:
+        rospy.logwarn("LED setup: %s", error)
     node = BearingTrackingNode(args)
     try:
-        rclpy.spin(node)
+        # 自动计时结束时保持 ROS 通信可用，让 finally 先向双车发零速再保存。
+        while not rospy.is_shutdown():
+            if node.experiment_complete.wait(timeout=0.1):
+                break
     except KeyboardInterrupt:
-        pass
+        rospy.loginfo("Ctrl+C received; stopping vehicles and diagnostics")
     finally:
+        # 后续清理有严格超时；忽略重复 Ctrl+C，避免零速发布和图片落盘
+        # 在 join 中途再次被 KeyboardInterrupt 打断。
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         node.stop()
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        if not rospy.is_shutdown():
+            rospy.signal_shutdown("bearing tracking stopped")
 
 
 if __name__ == "__main__":

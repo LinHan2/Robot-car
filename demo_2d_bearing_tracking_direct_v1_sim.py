@@ -21,6 +21,13 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 import numpy as np
+import yaml
+
+
+DEFAULT_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "bearing_tracking_params.yaml",
+)
 
 
 def limit_vector_norm(vector: np.ndarray, maximum: float) -> np.ndarray:
@@ -45,17 +52,24 @@ class Parameters:
     sigma: float = 0.52
     delta_t: float = 1.0
     nh: int = 30
+    max_history_execution_error: float = 0.0
+    max_history_target_execution_error: float = 0.0
+    history_forgetting_factor: float = 1.0
+    identifier_use_relative_velocity: bool = False
     gamma: float = 1.0e-7
     ac: float = 1.0e-5
     valid_tol: float = 100.0 * np.finfo(float).eps
     kc: float = 2.0
     kh: float = 1.2
+    max_history_condition: float = 1.0e3
     sigma_theta: float = 0.003
 
     af: float = 5.0
     lambda_s: float = 0.30
     ro: float = 0.02
     p_floor: float = 1.0e-9
+    mocap_position_observer_gain: float = 0.0
+    mocap_relative_velocity_observer_gain: float = 0.0
 
     # MATLAB targetInput(b): vd*d + ve*b + vj*J*b.
     vd: float = 0.0
@@ -126,6 +140,8 @@ class HistoryStack:
         self.vectors: List[np.ndarray] = []
         self.pi = np.zeros((p.nq, p.nq), dtype=float)
         self.theta_gamma = np.zeros(p.nq, dtype=float)
+        self.condition = 0.0
+        self.update_gated = False
 
     @staticmethod
     def spectrum(matrix: np.ndarray) -> np.ndarray:
@@ -162,12 +178,19 @@ class HistoryStack:
             if replacement >= 0:
                 self.windows[replacement] = w_new.copy()
                 self.vectors[replacement] = z_new.copy()
+        if self.p.history_forgetting_factor < 1.0:
+            factor = self.p.history_forgetting_factor
+            for index in range(len(self.windows)):
+                self.windows[index] *= factor
+                self.vectors[index] *= factor
         self._recompute()
 
     def _recompute(self) -> None:
         if not self.windows:
             self.pi.fill(0.0)
             self.theta_gamma.fill(0.0)
+            self.condition = 0.0
+            self.update_gated = False
             return
         wh = np.sum(self.windows, axis=0)
         wh = (wh + wh.T) * 0.5
@@ -177,9 +200,18 @@ class HistoryStack:
         if not np.any(active):
             self.pi.fill(0.0)
             self.theta_gamma.fill(0.0)
+            self.condition = 0.0
+            self.update_gated = False
             return
         qa = np.real(vectors[:, active])
         la = np.real(values[active])
+        self.condition = float(np.max(la) / np.min(la))
+        self.update_gated = (
+            self.p.max_history_condition > 0.0
+            and self.condition > self.p.max_history_condition
+        )
+        if self.update_gated:
+            return
         self.pi = qa @ qa.T
         self.pi = (self.pi + self.pi.T) * 0.5
         self.theta_gamma = qa @ ((qa.T @ zh) / la)
@@ -198,7 +230,14 @@ class CurrentWindow:
         self.ch = 0.0
         self.sff = np.zeros((p.nq, p.nq), dtype=float)
         self.sfh = np.zeros(p.nq, dtype=float)
+        self.execution_error_integral = 0.0
+        self.duration = 0.0
         self.count = 0
+
+    def execution_error_rms(self) -> float:
+        if self.duration <= 0.0:
+            return 0.0
+        return math.sqrt(self.execution_error_integral / self.duration)
 
     def statistics(self, threshold: float) -> Tuple[np.ndarray, np.ndarray, float]:
         if self.a < threshold:
@@ -211,8 +250,9 @@ class CurrentWindow:
         z = self.sfh - self.cf * self.ch / self.a
         return (w + w.T) * 0.5, z, 1.0
 
-    def accumulate(self, pb: np.ndarray, phi: np.ndarray, u_o: np.ndarray,
-                   dt: float) -> None:
+    def accumulate(self, pb: np.ndarray, phi: np.ndarray,
+                   u_ident: np.ndarray, u_o_actual: np.ndarray,
+                   u_o_command: np.ndarray, dt: float) -> None:
         f = pb @ self.g
         h = pb @ self.u
         v = pb @ self.b0
@@ -222,7 +262,10 @@ class CurrentWindow:
         self.sff += dt * (f.T @ f)
         self.sfh += dt * (f.T @ h)
         self.g += dt * phi
-        self.u += dt * u_o
+        self.u += dt * u_ident
+        execution_error = np.asarray(u_o_command) - np.asarray(u_o_actual)
+        self.execution_error_integral += dt * float(execution_error @ execution_error)
+        self.duration += dt
         self.count += 1
 
 
@@ -340,6 +383,17 @@ class BearingTrackingSimulation:
             - state.po @ co.T @ ro_inv @ co @ state.po
         )
         xi_dot = ao @ state.xi_hat + go + lo @ (-co @ state.xi_hat)
+        if p.use_true_relative_feedback and p.mocap_position_observer_gain > 0.0:
+            xi_dot[0:2] += p.mocap_position_observer_gain * (
+                s["r"] - state.xi_hat[0:2]
+            )
+        if p.mocap_relative_velocity_observer_gain > 0.0:
+            predicted_relative_velocity = (
+                state.u_t_hat - s["u_o"] + state.xi_hat[2:4]
+            )
+            xi_dot[2:4] += p.mocap_relative_velocity_observer_gain * (
+                s["u_t"] - s["u_o"] - predicted_relative_velocity
+            )
         return State(s["u_t"], s["u_o"], theta_dot, u_t_hat_dot, xi_dot, po_dot)
 
     def run(self) -> dict:
@@ -370,7 +424,14 @@ class BearingTrackingSimulation:
                 break
 
             # MATLAB's left-rectangle update of one finite data window.
-            self.window.accumulate(s["pb"], s["phi"], s["u_o"], p.dt)
+            # Ideal execution: dr/dt = u_t - u_o, so the corrected window target
+            # Pb*(u_o + dr/dt) equals Pb*u_t when the flag is enabled. Execution
+            # quality compares command with the actually executed velocity.
+            u_ident = (
+                s["u_o"] + (s["u_t"] - s["u_o"])
+                if p.identifier_use_relative_velocity else s["u_o"]
+            )
+            self.window.accumulate(s["pb"], s["phi"], u_ident, s["u_o"], s["u_o"], p.dt)
 
             # RK4 integration of plant, identifier, filter and observer.
             k1 = self._rhs(t, self.state, data)
@@ -390,7 +451,10 @@ class BearingTrackingSimulation:
 
             if self.window.count >= p.nw:
                 w_new, z_new, valid = self.window.statistics(p.valid_tol)
-                if valid > 0.0:
+                execution_error = self.window.execution_error_rms()
+                if valid > 0.0 and (
+                        p.max_history_execution_error <= 0.0
+                        or execution_error <= p.max_history_execution_error):
                     self.history.add(w_new, z_new)
                 self.window = CurrentWindow(self._bearing(self.state)[2], p)
 
@@ -464,14 +528,50 @@ def save_plot(results: dict, output: str, show: bool) -> None:
     plt.close(figure)
 
 
+def add_boolean_argument(parser: argparse.ArgumentParser, name: str,
+                         default: bool, help_text: str) -> None:
+    """Add --flag and --no-flag options compatible with Python 3.8."""
+    option_name = name[2:]
+    destination = option_name.replace("-", "_")
+    parser.add_argument(name, dest=destination, action="store_true",
+                        default=default, help=help_text)
+    parser.add_argument(f"--no-{option_name}", dest=destination,
+                        action="store_false", help=argparse.SUPPRESS)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pure Python bearing-only tracking simulation")
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH,
+                        help="YAML parameter file shared with the ROS controller")
     parser.add_argument("--duration", type=float, default=30.0,
                         help="simulation duration in seconds; MATLAB uses 200")
     parser.add_argument("--dt", type=float, default=0.01, help="simulation timestep")
     parser.add_argument("--relative-radius", type=float, default=0.7)
     parser.add_argument("--relative-angular-speed", type=float, default=0.3)
+    parser.add_argument("--relative-initial-phase-deg", type=float, default=120.0)
     parser.add_argument("--tracking-gain", type=float, default=0.25)
+    parser.add_argument("--rbf-count", type=int, default=30)
+    parser.add_argument("--rbf-sigma", type=float, default=0.52)
+    parser.add_argument("--window", type=float, default=1.0)
+    parser.add_argument("--history-size", type=int, default=30)
+    parser.add_argument("--max-history-execution-error", type=float, default=0.0)
+    parser.add_argument("--max-history-target-execution-error", type=float, default=0.0)
+    parser.add_argument("--history-forgetting-factor", type=float, default=1.0)
+    parser.add_argument("--gamma", type=float, default=1.0e-7)
+    parser.add_argument("--current-window-threshold", type=float, default=1.0e-5)
+    parser.add_argument("--window-valid-tolerance", type=float,
+                        default=100.0 * np.finfo(float).eps)
+    parser.add_argument("--current-window-gain", type=float, default=2.0)
+    parser.add_argument("--history-gain", type=float, default=1.2)
+    parser.add_argument("--max-history-condition", type=float, default=1.0e3)
+    parser.add_argument("--sigma-theta", type=float, default=0.003)
+    parser.add_argument("--target-estimate-filter-bandwidth", type=float, default=5.0)
+    parser.add_argument("--riccati-lambda", type=float, default=0.30)
+    parser.add_argument("--observer-noise-weight", type=float, default=0.02)
+    parser.add_argument("--riccati-eigenvalue-floor", type=float, default=1.0e-9)
+    parser.add_argument("--mocap-position-observer-gain", type=float, default=0.0)
+    parser.add_argument("--mocap-relative-velocity-observer-gain", type=float,
+                        default=0.0)
     parser.add_argument("--target-vd", type=float, default=0.0)
     parser.add_argument("--target-ve", type=float, default=0.1)
     parser.add_argument("--target-vj", type=float, default=0.1)
@@ -479,15 +579,15 @@ def parse_args() -> argparse.Namespace:
                         help="0 means no saturation, matching MATLAB")
     parser.add_argument("--max-target-speed", type=float, default=0.0,
                         help="0 means no saturation, matching MATLAB")
-    parser.add_argument(
-        "--use-true-relative-position", action=argparse.BooleanOptionalAction,
-        default=False,
-        help="use true relative position in Kr feedback (hybrid mocap equivalent)",
+    add_boolean_argument(
+        parser, "--use-true-relative-position", False,
+        "use true relative position in Kr feedback (hybrid mocap equivalent)",
     )
-    parser.add_argument(
-        "--target-soft-boundary", action=argparse.BooleanOptionalAction,
-        default=False,
+    add_boolean_argument(
+        parser, "--identifier-use-relative-velocity", False,
+        "use u_o plus relative velocity as the identifier window target",
     )
+    add_boolean_argument(parser, "--target-soft-boundary", False, "enable target soft boundary")
     parser.add_argument("--field-x-min", type=float, default=-1.5)
     parser.add_argument("--field-x-max", type=float, default=1.5)
     parser.add_argument("--field-y-min", type=float, default=-1.5)
@@ -496,6 +596,70 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-boundary-speed", type=float, default=0.15)
     parser.add_argument("--output", default="python_bearing_tracking_sim.png")
     parser.add_argument("--show", action="store_true", help="also open the Matplotlib figure")
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
+    config_args, _ = config_parser.parse_known_args()
+    config_path = os.path.abspath(os.path.expanduser(config_args.config))
+    try:
+        with open(config_path, "r", encoding="utf-8") as stream:
+            config = yaml.safe_load(stream) or {}
+    except OSError as exc:
+        parser.error(f"cannot read config file {config_path}: {exc}")
+    except yaml.YAMLError as exc:
+        parser.error(f"invalid YAML in {config_path}: {exc}")
+    if not isinstance(config, dict):
+        parser.error("YAML root must be a mapping of parameter names to values")
+
+    defaults = {
+        "dt": 1.0 / config["rate"],
+        "relative_radius": config["relative_radius"],
+        "relative_angular_speed": config["relative_angular_speed"],
+        "relative_initial_phase_deg": config["relative_initial_phase_deg"],
+        "tracking_gain": config["tracking_gain"],
+        "rbf_count": config["rbf_count"],
+        "rbf_sigma": config["rbf_sigma"],
+        "window": config["window"],
+        "history_size": config["history_size"],
+        "max_history_execution_error": config.get("max_history_execution_error", 0.0),
+        "max_history_target_execution_error": config.get(
+            "max_history_target_execution_error", 0.0
+        ),
+        "history_forgetting_factor": config.get("history_forgetting_factor", 1.0),
+        "identifier_use_relative_velocity": config.get(
+            "identifier_use_relative_velocity", False
+        ),
+        "gamma": config["gamma"],
+        "current_window_threshold": config["current_window_threshold"],
+        "window_valid_tolerance": config["window_valid_tolerance"],
+        "current_window_gain": config["current_window_gain"],
+        "history_gain": config["history_gain"],
+        "max_history_condition": config.get("max_history_condition", 1.0e3),
+        "sigma_theta": config["sigma_theta"],
+        "target_estimate_filter_bandwidth": config["target_estimate_filter_bandwidth"],
+        "riccati_lambda": config["riccati_lambda"],
+        "observer_noise_weight": config["observer_noise_weight"],
+        "riccati_eigenvalue_floor": config["riccati_eigenvalue_floor"],
+        "mocap_position_observer_gain": config.get(
+            "mocap_position_observer_gain", 0.0
+        ),
+        "mocap_relative_velocity_observer_gain": config.get(
+            "mocap_relative_velocity_observer_gain", 0.0
+        ),
+        "target_vd": config["target_vd"],
+        "target_ve": config["target_ve"],
+        "target_vj": config["target_vj"],
+        "max_pursuer_speed": config["max_speed"],
+        "max_target_speed": config["max_speed"],
+        "use_true_relative_position": config["use_mocap_relative_position"],
+        "target_soft_boundary": config["target_soft_boundary"],
+        "field_x_min": config["field_x_min"],
+        "field_x_max": config["field_x_max"],
+        "field_y_min": config["field_y_min"],
+        "field_y_max": config["field_y_max"],
+        "target_boundary_margin": config["target_boundary_margin"],
+        "target_boundary_speed": config["target_boundary_speed"],
+    }
+    parser.set_defaults(**defaults, config=config_path)
     return parser.parse_args()
 
 
@@ -508,7 +672,33 @@ def main() -> None:
         duration=args.duration,
         rd_radius=args.relative_radius,
         wd=args.relative_angular_speed,
+        phi0=math.radians(args.relative_initial_phase_deg),
         kr=args.tracking_gain,
+        q=args.rbf_count,
+        sigma=args.rbf_sigma,
+        delta_t=args.window,
+        nh=args.history_size,
+        max_history_execution_error=args.max_history_execution_error,
+        max_history_target_execution_error=(
+            args.max_history_target_execution_error
+        ),
+        history_forgetting_factor=args.history_forgetting_factor,
+        identifier_use_relative_velocity=args.identifier_use_relative_velocity,
+        gamma=args.gamma,
+        ac=args.current_window_threshold,
+        valid_tol=args.window_valid_tolerance,
+        kc=args.current_window_gain,
+        kh=args.history_gain,
+        max_history_condition=args.max_history_condition,
+        sigma_theta=args.sigma_theta,
+        af=args.target_estimate_filter_bandwidth,
+        lambda_s=args.riccati_lambda,
+        ro=args.observer_noise_weight,
+        p_floor=args.riccati_eigenvalue_floor,
+        mocap_position_observer_gain=args.mocap_position_observer_gain,
+        mocap_relative_velocity_observer_gain=(
+            args.mocap_relative_velocity_observer_gain
+        ),
         vd=args.target_vd,
         ve=args.target_ve,
         vj=args.target_vj,
@@ -534,6 +724,7 @@ def main() -> None:
     )
     results = BearingTrackingSimulation(p).run()
     save_plot(results, args.output, args.show)
+    tail_mask = results["time"] >= max(0.0, results["time"][-1] - 30.0)
     print(
         "[SIM] windows=%d, active=%d, final errors: input=%.4f m/s, "
         "localization=%.4f m, tracking=%.4f m"
@@ -541,6 +732,18 @@ def main() -> None:
             results["history_count"], int(results["active_directions"][-1]),
             results["input_error"][-1], results["localization_error"][-1],
             results["tracking_error"][-1],
+        )
+    )
+    print(
+        "[SIM] last-30s mean/RMS: input=%.4f/%.4f m/s, "
+        "localization=%.4f/%.4f m, tracking=%.4f/%.4f m"
+        % (
+            np.mean(results["input_error"][tail_mask]),
+            np.sqrt(np.mean(results["input_error"][tail_mask] ** 2)),
+            np.mean(results["localization_error"][tail_mask]),
+            np.sqrt(np.mean(results["localization_error"][tail_mask] ** 2)),
+            np.mean(results["tracking_error"][tail_mask]),
+            np.sqrt(np.mean(results["tracking_error"][tail_mask] ** 2)),
         )
     )
     print(

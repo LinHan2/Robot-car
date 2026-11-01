@@ -1,0 +1,75 @@
+# Tianbot1（目标）与 Tianbot2（追踪车）的 VRPN 实机参数。
+# 本文件同时供纯 Python 仿真和 ROS 实车控制器读取；改参数后先跑仿真。
+# 两个刚体必须已在 192.168.50.99 的 VRPN 服务端中发布。
+
+# -------------------- 机器人身份和 ROS 话题 --------------------
+target_id: 1                 # 目标车编号；用于未显式配置话题时生成名称
+pursuer_id: 2                # 追踪车编号；必须与 target_id 不同
+target_pose_topic: /vrpn_client_node/tianbot1/pose   # 目标车 VRPN PoseStamped
+pursuer_pose_topic: /vrpn_client_node/tianbot2/pose # 追踪车 VRPN PoseStamped
+target_vel_topic: /tianbot1/cmd_vel                  # 目标车底盘 Twist 话题
+vel_topic: /tianbot2/cmd_vel                         # 追踪车底盘 Twist 话题
+
+# -------------------- 稳定实机控制与辨识参数 --------------------
+rate: 50.0                   # 控制与发布频率 Hz；名义 dt=0.02 s
+duration: 180.0              # 控制器初始化后运行 3 分钟，自动停车并保存；0 表示手动 Ctrl+C
+window: 2.5                  # 当前有限数据窗口 DeltaT；两组实车回放均降低末段输入估计误差
+relative_radius: 0.7        # 期望相对圆半径 Rd，米
+relative_angular_speed: 0.75 # 两车速度放大 1.5 倍，同步放大相对轨迹角速度，rad/s
+relative_initial_phase_deg: 120.0 # 期望相对轨迹在 t=0 的世界系初相位，度
+tracking_gain: 0.9           # 小步反向 A/B：避开 Kr=1.2 激发的高次闭环谐波
+rbf_count: 30                # 每个目标速度输出通道的 RBF 节点数 q
+rbf_sigma: 0.52              # 单位圆上 Gaussian RBF 的宽度 sigma
+history_size: 20             # 保留的完整历史窗口上限 Nh；约 50 秒填满，再观察至少 3 个轨道周期
+max_history_execution_error: 0.2  # 拒绝命令-动捕速度 RMS 超过此值的异常窗口；0 禁用
+max_history_target_execution_error: 0.0 # 拒绝目标命令-动捕速度 RMS 超限窗口；0 禁用，待日志验证后启用
+history_forgetting_factor: 1.0 # 闭环实车无复现收益，回退禁用；离线回放增益被实车物理波动掩盖
+gamma: 0.0012       # 保留弱有效方向的最小稳定谱阈值；低于此值会放大实车噪声
+current_window_threshold: 1.0e-5 # 当前窗口参与在线更新的激活阈值 ac
+window_valid_tolerance: 2.220446049250313e-14 # 完整窗口有效性数值容差
+current_window_gain: 1.5     # 当前窗口并行学习增益 kc
+history_gain: 1.0           # 历史栈并行学习增益 kh
+max_history_condition: 5000.0 # 历史更新条件数门限；覆盖最新实车约 4535 的峰值，避免历史学习持续门控
+sigma_theta: 0.003           # 未激活参数方向的泄漏/正则化系数
+target_estimate_filter_bandwidth: 12.0 # af=16 实车未降低跟踪基频；保留已验证的 af=12 基线
+use_mocap_relative_position: true # Kr 反馈直接使用 VRPN 真值 r=pT-pO
+riccati_lambda: 0.15         # Riccati 稳定化参数 lambda_s
+observer_noise_weight: 0.02  # 观测器 R_o=ro*I 中的 ro
+riccati_eigenvalue_floor: 1.0e-8 # Po 投影为正定矩阵时的最小特征值
+mocap_position_observer_gain: 0.0  # 混合模式下温和抑制 bearing-only 径向 rHat 漂移，单位 1/s
+mocap_relative_velocity_observer_gain: 0.0 # 速度创新跨日志未稳定改善；默认保持 MATLAB 观测器
+
+# -------------------- 目标运动律与输出限制 --------------------
+max_speed: 0.8               # 两车世界速度命令模长上限，m/s
+target_vd: 0.0               # 目标固定世界方向速度分量 vd，m/s
+target_ve: 0.15              # 目标径向速度分量，m/s；从 0.1 放大 1.5 倍
+target_vj: 0.15              # 目标切向速度分量，m/s；蓝车总速度约 0.21 m/s
+# 在 Rd=0.7、wd=0.75 且相对跟踪收敛时，红车约 0.40 m/s，仍快于蓝车。
+target_direction_deg: 155.0  # 固定方向 d 的角度；vd=0 时不起作用
+target_soft_boundary: false  # 必须关闭；围栏回推属于辨识模型外输入
+field_x_min: -1.5            # 可选软围栏 x 下界，米；关闭时不生效
+field_x_max: 1.5             # 可选软围栏 x 上界，米；关闭时不生效
+field_y_min: -1.5            # 可选软围栏 y 下界，米；关闭时不生效
+field_y_max: 1.5             # 可选软围栏 y 上界，米；关闭时不生效
+target_boundary_margin: 0.30 # 可选软围栏开始回推的边界距离，米
+target_boundary_speed: 0.15  # 可选软围栏单轴最大回推速度，m/s
+
+# -------------------- 动捕数据质量与记录 --------------------
+stale_timeout: 0.3           # 任一 VRPN 位姿超过此时间未更新即停车，秒
+mocap_velocity_window: 0.06  # 位置窗口最小二乘速度拟合长度，秒
+mocap_velocity_filter_tau: 0.02 # 拟合速度一阶低通时间常数，秒；0 表示关闭
+mocap_velocity_alignment_delay: 0.03 # 实车闭环优于 40 ms；让辨识方位与因果动捕速度对齐
+identifier_use_relative_velocity: true # 窗口回归目标改为 Pb(u_o+dr/dt)=Pb*uT；上次卡顿系小车没电而非本开关
+mocap_max_valid_speed: 1.0  # 拟合速度异常拒绝阈值，m/s；0 表示关闭；高于目标最高速度
+telemetry_period: 1.0        # 控制台诊断输出周期，秒；0 表示关闭
+plot: true                   # 实验结束后保存 0～结束时刻的静态全程图
+plot_history: 30.0           # 兼容旧配置；全程图不截断时间范围
+save_plot: tracking_diagnostics_vrpn.png # MATLAB 风格诊断图最新副本
+save_analysis_plot: tracking_analysis_vrpn.png # 实车执行误差分析图最新副本
+save_comparison_plot: bearing_tracking_sim_vrpn.png # 四联对比图最新副本
+save_data: true              # 保存 CSV、NPZ、metadata 和 summary
+recording_filter: true       # 根据采样质量清理导出和绘图；完整原始 CSV/NPZ 仍保留
+recording_max_pose_age: 0.02 # 动捕超过 20 ms 未更新时标记异常；独立于控制停车阈值
+recording_min_velocity_span_ratio: 0.5 # 速度拟合窗口短于名义窗口的 50% 时标记异常
+recording_recovery_time: 0.15 # 异常后额外剔除 150 ms，覆盖速度滤波恢复过程
+data_dir: tracking_logs_vrpn # 每次实验的时间戳数据目录根路径

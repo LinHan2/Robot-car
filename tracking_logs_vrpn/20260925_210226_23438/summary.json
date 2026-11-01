@@ -1,0 +1,17 @@
+{
+  "samples": 261,
+  "duration_s": 5.200017418999778,
+  "mean_raw_control_dt_s": 0.020000040187738825,
+  "max_raw_control_dt_s": 0.020158420000370825,
+  "minimum_range_m": 0.5469272615422152,
+  "maximum_range_m": 0.995171733877986,
+  "maximum_tracking_error_m": 1.5344209731112528,
+  "maximum_localization_error_m": 0.6135729648363859,
+  "maximum_input_error_mps": 0.3363957839667201,
+  "maximum_pursuer_actual_speed_mps": 0.335926713826072,
+  "maximum_target_actual_speed_mps": 0.33868341770302246,
+  "rms_pursuer_command_execution_error_mps": 0.3557360058790887,
+  "rms_target_command_execution_error_mps": 0.0841989349039116,
+  "final_history_windows": 2,
+  "final_active_directions": 3
+}
